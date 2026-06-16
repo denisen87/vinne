@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<style>
+  table.profile {
+    border-collapse: collapse;
+    width: 100%;
+    margin-top: 10px;
+    font-size: 14px;
+  }
+
+  table.profile th,
+  table.profile td {
+    border: 1px solid #ddd;
+    padding: 8px 10px;
+    vertical-align: top;
+  }
+
+  table.profile th {
+    background: #f5f5f5;
+    text-align: left;
+    width: 180px;
+    font-weight: 600;
+  }
+
+  table.profile tr:nth-child(even) td {
+    background: #fafafa;
+  }
+
+  .muted {
+    opacity: 0.7;
+  }
+</style>
+
+
+  <meta charset="UTF-8">
+  <title>Poker Equity Calculator</title>
+</head>
+<body>
+  <!-- Datalist for spiller-autocomplete -->
+  <datalist id="boardPlayersDatalist"></datalist>
+
+  <section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0;">
+  <h2 style="margin:0 0 10px 0;">Dashboard</h2>
+
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+    <label>Backend:
+      <input id="apiBase" type="text" value="http://127.0.0.1:8011" style="width:240px;">
+    </label>
+
+    <label>Session:
+      <input id="dashSession" type="number" placeholder="8" style="width:90px;">
+    </label>
+
+    <label>Hero:
+      <input id="dashHero" type="text" value="angryshark" style="width:140px;">
+    </label>
+
+    <button class="tabBtn" data-tab="live">Live Coach</button>
+    <button class="tabBtn" data-tab="session">Session Overview</button>
+    <button class="tabBtn" data-tab="insights">Insights</button>
+    <button class="tabBtn" data-tab="plans">Plans</button>
+    <button class="tabBtn" data-tab="hands">Hands</button>
+    <button class="tabBtn" data-tab="starting">Start Hands</button>
+  </div>
+
+  <div id="dashStatus" style="opacity:.7; margin-top:8px;"></div>
+</section>
+
+<section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0; background:#f9f9f9;">
+  <h2 style="margin:0 0 10px 0;">📥 Import BetSolid Hand</h2>
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+    <input id="importFile" type="file" accept=".xml" style="flex:1; min-width:200px;">
+    <button id="btnImport" style="padding:8px 16px; background:#4CAF50; color:white; border:none; border-radius:4px; cursor:pointer;">Import Hand</button>
+    <span id="importStatus" style="opacity:.7; margin-left:8px;"></span>
+  </div>
+</section>
+
+<section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0; background:#f0f8ff;">
+  <h2 style="margin:0 0 8px 0;">⚡ Equity Calculator</h2>
+
+  <div id="sessionHands" style="margin-top:14px;">
+  <div style="font-weight:800; margin-bottom:6px;">Denne økten</div>
+  <div id="sessionHandsList" style="opacity:.7;">Ingen hender registrert ennå.</div>
+</div>
+
+<div class="tabPage" data-tab="live">
+  <!-- din eksisterende Live Coach + Denne økten + Flop profiles -->
+</div>
+
+<section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0; background:#fafafa;">
+  <h3 style="margin:0 0 10px 0;">3-bet Response Matrix</h3>
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+    <label>Spiller:
+      <input id="mtPlayer" type="text" placeholder="f.eks angryshark" list="boardPlayersDatalist" style="width:160px;">
+    </label>
+    <label>Session ID (valgfri):
+      <input id="mtSession" type="number" placeholder="f.eks 12" style="width:90px;">
+    </label>
+    <label style="display:flex; align-items:center; gap:6px; margin-left:12px; font-size:12px; opacity:.85;">
+      <input type="checkbox" id="hvAuto" checked>
+      Auto-refresh (4s)
+    </label>
+    <span id="hvStatus" style="opacity:.7; margin-left:8px;"></span>
+    <span id="hvAutoStatus" style="opacity:.7; margin-left:8px;"></span>
+    <label style="margin-left:8px;">
+      <input type="checkbox" id="mtGroupOpenPos" checked>
+      Group open positions
+    </label>
+    <button id="btnLoadMatrix">Load Matrix</button>
+    <span id="mtStatus" style="opacity:.7; margin-left:8px;"></span>
+  </div>
+  <div id="mtOut" style="margin-top:10px; overflow-x:auto;"></div>
+</section>
+
+<section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0; background:#fff;">
+  <h3 style="margin:0 0 10px 0;">3-bet Sampling Plan</h3>
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;">
+    <label>Spiller:
+      <input id="spPlayer" type="text" placeholder="f.eks angryshark" list="boardPlayersDatalist" style="width:160px;">
+    </label>
+    <label>Session ID (valgfri):
+      <input id="spSession" type="number" placeholder="f.eks 12" style="width:90px;">
+    </label>
+    <label style="margin-left:8px;">
+      <input type="checkbox" id="spGroupOpenPos" checked>
+      Group open positions
+    </label>
+    <button id="btnLoadSamplingPlan">Load Plan</button>
+    <span id="spStatus" style="opacity:.7; margin-left:8px;"></span>
+  </div>
+  <div id="spOut" style="margin-top:10px;"></div>
+</section>
+
+  <div id="flopProfiles" style="margin-top:12px;"></div>
+
+
+  <section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0;">
+  <h2 style="margin:0 0 8px 0;">Hand Viewer</h2>
+  <div class="tabPage" data-tab="live">
+  <!-- Hand Viewer -->
+</div>
+<div class="tabPage" data-tab="session" style="display:none;">
+  <h2>Session Overview</h2>
+  <div id="sessionHudBox" style="margin-top:10px;"></div>
+  <button id="btnSessionHud">Load Session HUD</button>
+  <div id="sessionHudOut" style="margin-top:10px;"></div>
+</div>
+
+
+
+  <section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0;">
+  <h2 style="margin:0 0 8px 0;">Player Profile</h2>
+  <div id="profileBox" style="margin-top:10px;"></div>
+  <div class="tabPage" data-tab="live">
+  <!-- Playar Profile -->
+</div>
+<div class="tabPage" data-tab="session" style="display:none;">
+  <h2>Session Overview</h2>
+  <button id="btnSessionHud">Load Session HUD</button>
+  <div id="sessionHudOut" style="margin-top:10px;"></div>
+</div>
+
+
+
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
+    <label>Spiller:
+      <input id="ppPlayer" type="text" value="angryshark" list="boardPlayersDatalist" style="width:160px;">
+    </label>
+
+    <label>Session ID (valgfri):
+      <input id="ppSession" type="number" placeholder="8" style="width:90px;">
+    </label>
+
+    <button id="ppLoad">Load Profile</button>
+    <span id="ppStatus" style="opacity:.7;"></span>
+  </div>
+
+  <div id="ppCard" style="background:#fafafa; padding:10px; border-radius:8px;">
+    <div style="opacity:.7;">Trykk “Load Profile”.</div>
+  </div>
+</section>
+
+
+  <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
+    <label>Hand ID:
+      <input id="hvHandId" type="number" placeholder="f.eks 55" style="width:110px;">
+    </label>
+    <button id="hvLoad">Load</button>
+    <span id="lhStatus" style="opacity:.7;"></span>
+    <span id="lhLast" style="opacity:.7; margin-left:8px;"></span>
+
+  </div>
+
+<div class="tabPage" data-tab="session" style="display:none;">
+  <h2>Session Overview</h2>
+
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <label>min_hands:
+      <input id="sessMinHands" type="number" value="5" style="width:80px;">
+    </label>
+    <button id="btnSessionHud">Load</button>
+    <span id="sessionHudStatus" style="opacity:.7;"></span>
+  </div>
+
+  <div id="sessionHudTableWrap" style="margin-top:10px;"></div>
+</div>
+
+
+
+
+  <div id="hvMeta" style="opacity:.8; margin-bottom:8px;"></div>
+  <div id="hvPlayersBox" style="margin:8px 0;"></div>
+  <div id="hvEquityBox" style="margin:10px 0; padding:10px; border:1px solid #ddd; background:#fff;">
+    <h3 style="margin:0 0 8px 0;">Equity Calculator</h3>
+    <div id="hvCardPicker" style="margin-bottom:10px;"></div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px;">
+      <div>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
+          <label>Hero:
+            <input id="hvHeroCards" type="text" placeholder="Ah Kh" style="width:110px;">
+          </label>
+          <label>Board:
+            <input id="hvBoardCards" type="text" placeholder="Qs Jd 2c" style="width:155px;">
+          </label>
+          <label>Villains:
+            <input id="hvVillains" type="number" min="1" max="8" value="1" style="width:55px;">
+          </label>
+          <button id="hvEquityCalc">Beregn</button>
+          <button id="hvUseHandCards">Hent fra hand</button>
+          <button id="hvCopyToMainEquity">Kopier til hoved</button>
+          <button id="hvCopyToProfileEquity">Kopier til live mot</button>
+          <span id="hvEquityStatus" style="opacity:.7;"></span>
+        </div>
+        <label style="display:block;">Ranges:
+          <input id="hvRanges" type="text" placeholder="valgfri, f.eks. QQ,AK,AQs" style="width:100%; max-width:680px;">
+        </label>
+      </div>
+      <div id="hvEquityResult" style="font-size:13px; opacity:.8;">Velg kort eller last en hånd.</div>
+    </div>
+  </div>
+  <div id="hvTableWrap"></div>
+</section>
+
+
+  <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+    <label>Spiller:
+      <input id="lhPlayer" type="text" value="angryshark" list="boardPlayersDatalist" style="width:140px;">
+    </label>
+
+    <label>Session ID (valgfri):
+      <input id="lhSession" type="number" placeholder="8" style="width:80px;">
+    </label>
+
+    <label>Mode:
+      <select id="lhMode">
+        <option value="targeted" selected>targeted</option>
+        <option value="latest">latest</option>
+      </select>
+    </label>
+
+    <label style="margin-left:8px;">
+    <input type="checkbox" id="lhAutoOpen" checked>
+    Auto-open hand
+    </label>
+
+    <button id="lhStart">Start</button>
+    <button id="lhStop">Stop</button>
+    <span id="lhStatus" style="opacity:.7;"></span>
+  </div>
+
+  <label style="margin-left:8px;">
+  <input type="checkbox" id="lhAutoOpen" checked>
+  Auto-open hand
+</label>
+
+<label style="margin-left:8px;">
+  Open:
+  <select id="lhAutoOpenMode">
+    <option value="hand" selected>live hand_id</option>
+    <option value="evidence">evidence (første)</option>
+  </select>
+</label>
+
+
+  <div id="lhCard" style="background:#fafafa; padding:10px; border-radius:8px;">
+    <div><b>Ingen hint ennå</b></div>
+    <div style="opacity:.7;">Trykk Start.</div>
+  </div>
+</section>
+
+<section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0;">
+  <h2 style="margin:0 0 12px 0;">⚡ Equity Calculator</h2>
+
+  <!-- Manual live controls -->
+  <div style="background:#e8f5e9; padding:10px; border-radius:6px; margin-bottom:12px; border-left:4px solid #4CAF50;">
+    <div style="font-weight:600; margin-bottom:8px;">🎮 Live Game Mode</div>
+    <div style="display:flex; gap:8px; margin-bottom:8px;">
+      <button id="btnStartLiveGame" style="padding:8px 12px; background:#4CAF50; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:600;">
+        ▶ Start Live Polling
+      </button>
+      <button id="btnStopLiveGame" style="padding:8px 12px; background:#f44336; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:600; display:none;">
+        ⏹ Stop Live Polling
+      </button>
+      <div id="liveGameStatus" style="flex:1; padding:8px; background:white; border-radius:4px; font-size:12px; opacity:.7;">
+        Ikke aktiv
+      </div>
+    </div>
+    <div style="font-size:11px; opacity:.7;">
+      🔍 Når Live Polling er aktiv, vil equity-kalkulatoren automatisk oppdatere seg basert på kortene du spiller fra BetSolid.
+    </div>
+  </div>
+
+  <div id="manualCardPicker" style="margin-bottom:16px;"></div>
+
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px;">
+    <!-- LEFT: Inputs -->
+    <div style="background:#fafafa; padding:12px; border-radius:8px;">
+      <div style="font-weight:600; margin-bottom:10px;">Setup</div>
+
+      <label style="display:block; margin-bottom:10px;">
+        <div style="font-size:12px; opacity:.7; margin-bottom:4px;">Dine kort (f.eks: Ah Kh)</div>
+        <input type="text" id="hero" placeholder="Ah Kh" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px;" onchange="handleCardInput()">
+      </label>
+
+      <label style="display:block; margin-bottom:10px;">
+        <div style="font-size:12px; opacity:.7; margin-bottom:4px;">Board (valgfri, f.eks: Qs Jd 2c)</div>
+        <input type="text" id="board" placeholder="Qs Jd 2c" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px;" onchange="handleCardInput()">
+      </label>
+
+      <label style="display:block; margin-bottom:12px;">
+        <div style="font-size:12px; opacity:.7; margin-bottom:4px;">Antall motspillere</div>
+        <input type="number" id="numVillains" value="1" min="1" max="8" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px;">
+      </label>
+
+      <label style="display:block; margin-bottom:12px;">
+        <div style="font-size:12px; opacity:.7; margin-bottom:4px;">Motspiller Ranges (auto-fylt fra spiller-data)</div>
+        <input type="text" id="villains" placeholder="QQ,AK, AQs,AJs,KQs,..." style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px; font-family:monospace; font-size:11px;">
+      </label>
+
+      <div id="adaptivePlayerDetails" style="margin-bottom:12px; padding:8px; background:#f5f5f5; border-radius:4px; border-left:3px solid #2196F3; font-size:11px; opacity:.85;">
+        <div style="font-weight:600; margin-bottom:4px;">🎯 Adaptive Motspillere:</div>
+        <div style="opacity:.7;">Venter på data fra bordet...</div>
+      </div>
+
+      <label style="display:flex; gap:8px; align-items:center; margin-bottom:10px; font-size:12px; opacity:.85;">
+        <input type="checkbox" id="autoEquity">
+        Auto-beregn når kort/board oppdateres
+      </label>
+      <div id="autoEquityStatus" style="font-size:11px; opacity:.6; margin-bottom:10px;">Live: venter på gyldige kort.</div>
+
+      <button id="calcBtn" style="width:100%; padding:10px; background:#2196F3; color:white; border:none; border-radius:4px; font-weight:600; cursor:pointer;">
+        Beregn Equity
+      </button>
+      <button id="handProbBtn" style="width:100%; margin-top:8px; padding:10px; background:#111; color:white; border:none; border-radius:4px; font-weight:600; cursor:pointer;">
+        Beregn håndsjanser fra historikk
+      </button>
+    </div>
+
+    <!-- RIGHT: Results -->
+    <div style="background:#fff; padding:12px; border-radius:8px; border:1px solid #e0e0e0;">
+      <div style="font-weight:600; margin-bottom:10px;">Resultat</div>
+      <div id="result" style="font-size:13px; opacity:.7;">Fyll inn kortene og trykk "Beregn Equity"</div>
+      <div id="equityDetails" style="margin-top:10px; font-size:12px;"></div>
+      <div id="heroHistoryMatchBox" style="margin-top:12px; font-size:12px;"></div>
+      <div id="handProbResult" style="margin-top:12px; font-size:12px;"></div>
+    </div>
+  </div>
+
+  <section style="border:1px solid #eee; padding:10px; border-radius:8px; background:#fff;">
+    <div style="font-weight:800; margin-bottom:6px;">📋 Kort Historie</div>
+    <div id="cardHistoryBox" style="opacity:.9; font-size:13px; max-height:150px; overflow-y:auto;">Ingen kort historikk ennå.</div>
+  </section>
+</section>
+
+<!-- PRESET RANGE BUILDER -->
+<section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0;">
+  <h2 style="margin:0 0 12px 0;">📚 Preset Range Builder</h2>
+  
+  <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;">
+    <label style="font-size:12px; opacity:.8;">Velg preset:</label>
+    <button class="presetBtn" data-preset="btn_open" style="padding:6px 12px; background:#2196F3; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">BTN Open</button>
+    <button class="presetBtn" data-preset="sb_open" style="padding:6px 12px; background:#2196F3; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">SB Open</button>
+    <button class="presetBtn" data-preset="bb_defense" style="padding:6px 12px; background:#FF9800; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">BB Defense</button>
+    <button class="presetBtn" data-preset="4bet_value" style="padding:6px 12px; background:#f44336; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">4-bet Value</button>
+    <button class="presetBtn" data-preset="4bet_bluff" style="padding:6px 12px; background:#9C27B0; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">4-bet Bluff</button>
+    <button class="presetBtn" data-preset="flush_draw" style="padding:6px 12px; background:#00BCD4; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">Flush Draw</button>
+  </div>
+
+  <div style="background:#fafafa; padding:10px; border-radius:4px; min-height:40px;">
+    <div id="presetDisplay" style="font-size:12px; opacity:.8; word-wrap:break-word; line-height:1.6;">Velg en preset for å se hånder</div>
+  </div>
+</section>
+
+<!-- MULTI-HAND COMPARISON -->
+<section style="border:1px solid #ddd; padding:12px; border-radius:10px; margin:12px 0;">
+  <h2 style="margin:0 0 12px 0;">🔄 Multi-Hand Comparison</h2>
+
+  <div style="margin-bottom:12px;">
+    <div style="font-size:12px; opacity:.8; margin-bottom:6px;">Legg til hender å sammenligne:</div>
+    <div style="display:flex; gap:8px; flex-wrap:wrap;">
+      <input type="text" id="mhHand1" placeholder="F.eks: AK" value="AK" style="padding:6px 8px; border:1px solid #ccc; border-radius:4px; width:100px;">
+      <input type="text" id="mhHand2" placeholder="F.eks: TT" value="TT" style="padding:6px 8px; border:1px solid #ccc; border-radius:4px; width:100px;">
+      <input type="text" id="mhHand3" placeholder="F.eks: AQs" style="padding:6px 8px; border:1px solid #ccc; border-radius:4px; width:100px;">
+      <input type="text" id="mhBoard" placeholder="Board: Qs Jd 2c" style="padding:6px 8px; border:1px solid #ccc; border-radius:4px; width:160px;">
+      <button id="btnCompare" style="padding:6px 12px; background:#4CAF50; color:white; border:none; border-radius:4px; cursor:pointer; font-weight:600;">Sammenlign</button>
+    </div>
+  </div>
+
+  <div id="compareStatus" style="opacity:.7; font-size:12px; margin-bottom:8px;"></div>
+  <div id="compareOut" style="margin-top:10px;"></div>
+</section>
+
+  <script src="script.js?v=hand-viewer-live-players-poll-20260616b"></script>
+<div class="tabPage" data-tab="insights" style="display:none;">
+  <h2>Session Insights</h2>
+  <label>min_hands:
+    <input id="insMinHands" type="number" value="5" style="width:80px;">
+  </label>
+  <label>mode:
+    <select id="insMode">
+      <option value="leaks">leaks</option>
+      <option value="obs">obs</option>
+      <option value="both" selected>both</option>
+    </select>
+  </label>
+  <button id="btnSessionInsights">Load Insights</button>
+  <div id="sessionInsightsOut" style="margin-top:10px;"></div>
+</div>
+
+<div class="tabPage" data-tab="plans" style="display:none;">
+  <h2>Plans</h2>
+  <button id="btnImpactPlan">Load Impact Plan</button>
+  <button id="btnBBPlan" style="margin-left:8px;">Load BB Spot Plan</button>
+  <div id="plansOut" style="margin-top:10px;"></div>
+</div>
+
+<div class="tabPage" data-tab="hands" style="display:none;">
+  <h2>Hands (i session)</h2>
+  <button id="btnSessionHands">Load Hands</button>
+  <div id="handsOut" style="margin-top:10px;"></div>
+</div>
+
+<div class="tabPage" data-tab="starting" style="display:none;">
+  <h2>Beste starthender</h2>
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <label>Spiller:
+      <input id="shPlayer" type="text" value="angryshark" list="boardPlayersDatalist" style="width:140px;">
+    </label>
+    <label>Session ID:
+      <input id="shSession" type="number" placeholder="valgfri" style="width:90px;">
+    </label>
+    <label>min_hands:
+      <input id="shMinHands" type="number" value="0" min="0" style="width:80px;">
+    </label>
+    <label>limit:
+      <input id="shLimit" type="number" value="1000" min="1" max="10000" style="width:90px;">
+    </label>
+    <label>sim:
+      <input id="shProbIters" type="number" value="150" min="25" max="2000" style="width:80px;">
+    </label>
+    <label>villains:
+      <input id="shVillains" type="number" value="1" min="1" max="8" style="width:60px;">
+    </label>
+    <label style="display:flex; align-items:center; gap:6px;">
+      <input id="shAuto" type="checkbox" checked>
+      Auto
+    </label>
+    <label style="display:flex; align-items:center; gap:6px;">
+      <input id="shIncludeAll" type="checkbox" checked>
+      Alle 169
+    </label>
+    <button id="btnStartingHands">Load</button>
+    <span id="startingHandsStatus" style="opacity:.7;"></span>
+  </div>
+  <div id="startingHandsOut" style="margin-top:10px; overflow-x:auto;"></div>
+</div>
+
+
+</body>
+</html>
