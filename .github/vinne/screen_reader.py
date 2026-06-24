@@ -13,17 +13,23 @@ import pyautogui
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "fronted" / "current_live_cards.json"
 DEBUG_HERO = ROOT / "fronted" / "hero_cards_debug_latest.png"
+DEBUG_RAW = ROOT / "fronted" / "hero_cards_debug_raw.png"
 DEBUG_WIDE = ROOT / "fronted" / "hero_cards_debug_wide.png"
+CALIBRATION_CAPTURE = ROOT / "fronted" / "calibration_capture.png"
+CALIBRATION_ARCHIVE = ROOT / "fronted" / "calibration_captures"
+CALIBRATION_LATEST = CALIBRATION_ARCHIVE / "latest.txt"
+CALIBRATION_INDEX = CALIBRATION_ARCHIVE / "index.json"
 CURRENT_GAME = ROOT / "backend" / "current_game.json"
 TEMPLATE_DIR = ROOT / ".github" / "vinne" / "card_templates"
-VERSION = "green_table_suit_fallback_v25"
+VERSION = "green_table_suit_fallback_v46"
+CALIBRATION_REVIEW = ROOT / "fronted" / "calibration_review.png"
 SCREENSHOT_DELAY_SECONDS = float(os.getenv("SCREENSHOT_DELAY_SECONDS", "2.0"))
 
 # Crop relative to the active BetSolid table window. Absolute screen crops broke
 # whenever the browser/BetSolid windows moved or a replay window was opened.
 BASE_HERO_REGION = (245, 330, 260, 190)
-SEARCH_DX = (-10, 0, 10, 20, 30)
-SEARCH_DY = (-5, 0, 5, 10)
+SEARCH_DX = (-70, -50, -30, -10, 0, 10, 30, 50, 70, 90, 110)
+SEARCH_DY = (-60, -45, -30, -15, 0, 15, 30, 45, 60)
 
 # Card boxes inside HERO_REGION. They are intentionally a bit generous.
 LEFT_CARD_RECT = (78, 24, 58, 82)
@@ -32,16 +38,60 @@ RIGHT_CARD_RECTS = [
     (130, 24, 58, 82),
     (122, 24, 62, 82),
 ]
+HERO_PAIR_CENTER_MIN = 95
+HERO_PAIR_CENTER_MAX = 225
+HERO_PAIR_CENTER_TARGET = 150
 
 RANKS = "23456789TJQKA"
 SUITS = "HDCS"
 TEMPLATE_SIZE = (28, 28)
+LAST_ARCHIVE_AT = 0.0
+LAST_ARCHIVE_KEY = None
 
 
 def save_debug_image(path: Path, img):
     ok, encoded = cv2.imencode(".png", img)
     if ok:
         path.write_bytes(encoded.tobytes())
+
+
+def safe_label(value: str, fallback="blank"):
+    label = "".join(ch if ch.isalnum() else "_" for ch in (value or "").strip())
+    return label.strip("_") or fallback
+
+
+def archive_calibration_crop(crop, region, score, cards, error):
+    global LAST_ARCHIVE_AT, LAST_ARCHIVE_KEY
+
+    now = time.time()
+    key = (cards or "", error or "", str(region), int(score or 0))
+    if key == LAST_ARCHIVE_KEY and now - LAST_ARCHIVE_AT < 5.0:
+        return None
+    if now - LAST_ARCHIVE_AT < 1.5:
+        return None
+
+    CALIBRATION_ARCHIVE.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(now))
+    suffix = safe_label(cards or error, "unread")[:60]
+    path = CALIBRATION_ARCHIVE / f"{stamp}_{int((now % 1) * 1000):03d}_{suffix}.png"
+    save_debug_image(path, crop)
+    try:
+        CALIBRATION_LATEST.write_text(str(path), encoding="utf-8")
+    except Exception:
+        pass
+    LAST_ARCHIVE_AT = now
+    LAST_ARCHIVE_KEY = key
+    return path
+
+
+def read_image(path: Path):
+    try:
+        raw = np.fromfile(str(path), dtype=np.uint8)
+        if raw.size == 0:
+            return None
+        return cv2.imdecode(raw, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
 
 
 def valid_card_text(cards_text: str) -> list[str]:
@@ -99,8 +149,14 @@ def card_body_mask(hsv):
 def extract_rank_and_suit_masks(card_img):
     card_img = trim_to_card_body(card_img)
     h, w = card_img.shape[:2]
-    rank_area = card_img[3 : min(19, h), 2 : min(23, w)]
-    suit_area = card_img[14 : min(36, h), 2 : min(24, w)]
+    rank_area = card_img[
+        max(0, int(h * 0.04)) : min(h, int(h * 0.31)),
+        max(0, int(w * 0.03)) : min(w, int(w * 0.38)),
+    ]
+    suit_area = card_img[
+        max(0, int(h * 0.22)) : min(h, int(h * 0.58)),
+        max(0, int(w * 0.03)) : min(w, int(w * 0.40)),
+    ]
     return ink_mask(rank_area), ink_mask(suit_area)
 
 
@@ -185,14 +241,23 @@ def trim_to_card_body(card_img):
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
         if w * h >= 80 and w >= 10 and h >= 10:
-            boxes.append((x, y, w, h))
+            boxes.append((x, y, w, h, cv2.contourArea(c)))
     if not boxes:
         return card_img
 
-    x1 = max(0, min(x for x, _, _, _ in boxes) - 1)
-    y1 = max(0, min(y for _, y, _, _ in boxes) - 1)
-    x2 = min(card_img.shape[1], max(x + w for x, _, w, _ in boxes) + 1)
-    y2 = min(card_img.shape[0], max(y + h for _, y, _, h in boxes) + 1)
+    main = max(boxes, key=lambda box: box[4])
+    if main[2] >= 25 and main[3] >= 35:
+        x, y, w, h, _ = main
+        x1 = max(0, x - 1)
+        y1 = max(0, y - 1)
+        x2 = min(card_img.shape[1], x + w + 1)
+        y2 = min(card_img.shape[0], y + h + 1)
+        return card_img[y1:y2, x1:x2]
+
+    x1 = max(0, min(x for x, _, _, _, _ in boxes) - 1)
+    y1 = max(0, min(y for _, y, _, _, _ in boxes) - 1)
+    x2 = min(card_img.shape[1], max(x + w for x, _, w, _, _ in boxes) + 1)
+    y2 = min(card_img.shape[0], max(y + h for _, y, _, h, _ in boxes) + 1)
     if x2 - x1 < 16 or y2 - y1 < 20:
         return card_img
     return card_img[y1:y2, x1:x2]
@@ -208,6 +273,35 @@ def color_mask(hsv, suit):
     if suit == "C":
         return cv2.inRange(hsv, np.array([35, 25, 25]), np.array([95, 255, 255]))
     return cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 170, 135]))
+
+
+def suit_color_scores(card_img):
+    card_img = trim_to_card_body(card_img)
+    h, w = card_img.shape[:2]
+    suit_area = card_img[
+        max(0, int(h * 0.22)) : min(h, int(h * 0.55)),
+        max(0, int(w * 0.03)) : min(w, int(w * 0.38)),
+    ]
+    suit_hsv = cv2.cvtColor(suit_area, cv2.COLOR_BGR2HSV)
+    value_mask = cv2.inRange(suit_hsv[:, :, 2], 20, 235)
+    return {
+        suit: int(np.count_nonzero(cv2.bitwise_and(color_mask(suit_hsv, suit), value_mask)))
+        for suit in ("H", "D", "C", "S")
+    }
+
+
+def suit_from_color(card_img):
+    scores = suit_color_scores(card_img)
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    best, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0
+    if best_score < 18:
+        return "", scores
+    if best == "S" and scores["C"] >= best_score * 0.70:
+        return "C", scores
+    if best_score - second_score < 10 and best not in ("H", "D"):
+        return "", scores
+    return best, scores
 
 
 def find_rank_blob_and_suit(card_img):
@@ -231,20 +325,15 @@ def find_rank_blob_and_suit(card_img):
     blob = rank_mask if rank_boxes else None
 
     templ_suit, suit_match_score = template_match(suit_mask, "suit")
-    if templ_suit:
+    color_suit, suit_scores = suit_from_color(card_img)
+    if templ_suit and suit_match_score >= 0.97:
+        suit = templ_suit
+    elif templ_suit and templ_suit == color_suit:
+        suit = templ_suit
+    elif templ_suit in ("H", "D", "C") and suit_scores.get(templ_suit, 0) >= 30:
         suit = templ_suit
     else:
-        suit_area = card_img[14 : min(34, h), 2 : min(22, w)]
-        suit_hsv = cv2.cvtColor(suit_area, cv2.COLOR_BGR2HSV)
-        suit_scores = {
-            suit: int(np.count_nonzero(cv2.bitwise_and(color_mask(suit_hsv, suit), cv2.inRange(suit_hsv[:, :, 2], 20, 235))))
-            for suit in ("H", "D", "C", "S")
-        }
-        suit = max(suit_scores, key=suit_scores.get)
-        if suit == "S" and suit_scores["C"] >= suit_scores["S"] * 0.85:
-            suit = "C"
-        if suit_scores[suit] < 8:
-            suit = ""
+        suit = color_suit
 
     if blob is not None:
         return blob, suit
@@ -312,13 +401,46 @@ def rank_features(blob):
 
 def classify_rank(blob):
     templ_rank, rank_match_score = template_match(blob, "rank")
-    if templ_rank:
+    f = rank_features(blob)
+    if not f:
+        return ""
+    if f["ink"] / max(1, f["h"] * f["w"]) > 0.68:
+        return ""
+
+    looks_like_ten = (
+        f["h"] >= 13
+        and f["w"] >= 15
+        and f["left"] >= 14
+        and f["right"] >= 18
+        and f["center"] >= 10
+        and f["mid"] >= f["top"] * 0.75
+    )
+    narrow_left_stroke = f["left"] >= max(40, f["ink"] * 0.75) and (f["center"] + f["right"]) <= max(8, f["ink"] * 0.15)
+    if templ_rank == "T" and rank_match_score >= 0.88:
+        return "T"
+
+    # Template history can occasionally confuse BetSolid's wide 8 with 6.
+    # Prefer the shape features when the glyph is clearly a broad, closed 8.
+    if (
+        templ_rank == "6"
+        and f["w"] >= 14
+        and f["ink"] >= 90
+        and f["mid"] >= f["top"] * 0.9
+        and f["bot"] >= f["top"] * 0.9
+        and abs(f["left"] - f["right"]) < max(24, f["ink"] * 0.35)
+    ):
+        return "8"
+
+    if templ_rank in "23456789" and rank_match_score >= 0.88 and not narrow_left_stroke:
+        return templ_rank
+    if templ_rank and rank_match_score >= 0.92 and not narrow_left_stroke:
         return templ_rank
     if rank_match_score >= 0.90:
         return ""
 
-    f = rank_features(blob)
-    if not f:
+    # Keep shape-only guesses opt-in. They can read hidden/covered cards as
+    # real cards when the avatar or table UI creates card-like white blobs.
+    if os.getenv("SCREEN_READER_ALLOW_RANK_HEURISTICS", "").lower() not in ("1", "true", "yes"):
         return ""
 
     # Small, practical rules for BetSolid's tiny corner font.
@@ -378,7 +500,7 @@ def detect_card_rects(crop):
             continue
         if not (20 <= w <= 130 and 18 <= h <= 100):
             continue
-        if y < 35 or y > 95:
+        if y < 20 or y > 95:
             continue
         boxes.append((x, y, w, h, area))
 
@@ -456,7 +578,19 @@ def card_rect_score(card_rect, img):
 def crop_score(crop):
     detected = detect_card_rects(crop)
     if len(detected) >= 2:
-        return sum(card_rect_score(rect, crop) for rect in detected) + 10000
+        left, right = detected[:2]
+        pair_left = min(left[0], right[0])
+        pair_right = max(left[0] + left[2], right[0] + right[2])
+        pair_center = (pair_left + pair_right) / 2
+        avg_y = (left[1] + right[1]) / 2
+        if not (HERO_PAIR_CENTER_MIN <= pair_center <= HERO_PAIR_CENTER_MAX):
+            return 0
+
+        # Prefer the real hero-card zone inside the crop. Without this, white
+        # chip stacks on the left side of the table can look enough like cards
+        # to win the crop search.
+        position_bonus = max(0, int(2500 - abs(pair_center - HERO_PAIR_CENTER_TARGET) * 35 - abs(avg_y - 55) * 20))
+        return sum(card_rect_score(rect, crop) for rect in detected) + 10000 + position_bonus
 
     return 0
 
@@ -468,7 +602,7 @@ def candidate_regions():
             region = (x + dx, y + dy, w, h)
             # Do not scan high board/player-card areas. If we cannot find hero
             # cards in this lower band, return blank instead of wrong cards.
-            if 300 <= region[1] <= 350:
+            if 270 <= region[1] <= 390:
                 yield region
 
 
@@ -565,6 +699,7 @@ def best_hero_crop():
 
 
 def read_cards_from_crop(crop):
+    save_debug_image(DEBUG_RAW, crop)
     debug = crop.copy()
     detected = detect_card_rects(crop)
     rects = detected if len(detected) >= 2 else []
@@ -631,20 +766,25 @@ def learn_templates_from_known_hero(crop):
 
 def read_hero_cards_from_screen():
     crop, region, score = best_hero_crop()
+    if score <= 0:
+        archive = archive_calibration_crop(crop, region, score, "", "no_valid_hero_crop")
+        extra = f"; capture={archive.name}" if archive else ""
+        return "", f"no_valid_hero_crop; region={region}; score={score}; learned=0{extra}"
     learned = learn_templates_from_known_hero(crop)
     cards, error = read_cards_from_crop(crop)
+    archive = archive_calibration_crop(crop, region, score, cards, error)
+    capture = f"; capture={archive.name}" if archive else ""
     if error:
-        error = f"{error}; region={region}; score={score}; learned={learned}"
+        error = f"{error}; region={region}; score={score}; learned={learned}{capture}"
     return cards, error
 
 
-def calibrate_from_current_screen(cards_text):
+def calibrate_crop(crop, cards_text, region, score):
     expected = valid_card_text(cards_text)
     if len(expected) != 2:
         print('Bruk: python .github\\vinne\\screen_reader.py --calibrate "AS KH"')
         return 2
 
-    crop, region, score = best_hero_crop()
     save_debug_image(ROOT / "fronted" / "calibration_latest.png", crop)
     rects = detect_card_rects(crop)
     current_read, current_error = read_cards_from_crop(crop)
@@ -665,6 +805,179 @@ def calibrate_from_current_screen(cards_text):
     after_read, after_error = read_cards_from_crop(crop)
     print(f"saved={saved} after={after_read!r} error={after_error!r}")
     return 0 if saved or valid_card_text(after_read) == expected else 1
+
+
+def calibrate_from_current_screen(cards_text):
+    crop, region, score = best_hero_crop()
+    return calibrate_crop(crop, cards_text, region, score)
+
+
+def capture_then_calibrate(cards_text=None):
+    global SCREENSHOT_DELAY_SECONDS
+    old_delay = SCREENSHOT_DELAY_SECONDS
+    SCREENSHOT_DELAY_SECONDS = 0.05
+    try:
+        crop, region, score = best_hero_crop()
+    finally:
+        SCREENSHOT_DELAY_SECONDS = old_delay
+
+    save_debug_image(CALIBRATION_CAPTURE, crop)
+    print(f"Bildet er fanget. region={region} score={score}")
+    print(r"Se eventuelt fronted\calibration_capture.png.")
+    if cards_text is None:
+        cards_text = input('Skriv kortene fra fanget bilde, f.eks. "8D 9C": ').strip()
+    return calibrate_crop(crop, cards_text, region, score)
+
+
+def calibrate_from_saved_capture(cards_text):
+    crop = read_image(CALIBRATION_CAPTURE)
+    if crop is None:
+        print(r"Fant ikke fronted\calibration_capture.png. Kjor --capture-calibrate forst.")
+        return 1
+    return calibrate_crop(crop, cards_text, ("saved_capture",), crop_score(crop))
+
+
+def resolve_capture_path(path_text):
+    path = Path(path_text.strip().strip('"'))
+    if not path.is_absolute():
+        path = ROOT / path
+    return path
+
+
+def calibrate_from_file(path_text, cards_text):
+    path = resolve_capture_path(path_text)
+    crop = read_image(path)
+    if crop is None:
+        print(f"Fant ikke/kunne ikke lese: {path}")
+        return 1
+    print(f"Kalibrerer fra: {path}")
+    return calibrate_crop(crop, cards_text, (str(path),), crop_score(crop))
+
+
+def cards_from_capture_name(path: Path):
+    cards = []
+    for part in path.stem.upper().split("_"):
+        if len(part) in (2, 3):
+            parsed = valid_card_text(part)
+            if len(parsed) == 1:
+                cards.extend(parsed)
+    return cards[-2:] if len(cards) >= 2 else []
+
+
+def calibrate_from_latest(cards_text):
+    if not CALIBRATION_LATEST.exists():
+        print(r"Fant ingen latest.txt. Start screen_reader.py og la den fange minst ett bilde.")
+        return 1
+    path_text = CALIBRATION_LATEST.read_text(encoding="utf-8").strip()
+    path = resolve_capture_path(path_text)
+    expected = valid_card_text(cards_text)
+    named = cards_from_capture_name(path)
+    if named and expected and named != expected:
+        print(f"STOPP: siste bilde ser ut til å være {' '.join(named)}, ikke {' '.join(expected)}.")
+        print(f"Bruk riktig fasit for dette bildet, eller velg riktig fil fra:")
+        print(CALIBRATION_ARCHIVE)
+        return 2
+    return calibrate_from_file(path_text, cards_text)
+
+
+def recent_capture_paths(limit=20):
+    if not CALIBRATION_ARCHIVE.exists():
+        return []
+    return sorted(
+        CALIBRATION_ARCHIVE.glob("*.png"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:limit]
+
+
+def list_captures(limit_text=None):
+    try:
+        limit = int(limit_text) if limit_text else 20
+    except ValueError:
+        limit = 20
+    paths = recent_capture_paths(limit)
+    if not paths:
+        print(r"Ingen bilder i fronted\calibration_captures ennå.")
+        return 1
+    CALIBRATION_ARCHIVE.mkdir(parents=True, exist_ok=True)
+    CALIBRATION_INDEX.write_text(
+        json.dumps([str(path) for path in paths], indent=2),
+        encoding="utf-8",
+    )
+    print("Indeks låst. Bruk --calibrate-index med nummeret under.")
+    for idx, path in enumerate(paths, 1):
+        cards = cards_from_capture_name(path)
+        label = " ".join(cards) if cards else "-"
+        print(f"{idx:02d}: {path.name}  [{label}]")
+    return 0
+
+
+def review_captures(limit_text=None):
+    try:
+        limit = int(limit_text) if limit_text else 12
+    except ValueError:
+        limit = 12
+    paths = recent_capture_paths(limit)
+    if not paths:
+        print(r"Ingen bilder i fronted\calibration_captures ennå.")
+        return 1
+
+    CALIBRATION_ARCHIVE.mkdir(parents=True, exist_ok=True)
+    CALIBRATION_INDEX.write_text(
+        json.dumps([str(path) for path in paths], indent=2),
+        encoding="utf-8",
+    )
+
+    thumb_w, thumb_h = 260, 190
+    label_h = 34
+    cols = 3
+    rows = int(np.ceil(len(paths) / cols))
+    sheet = np.full((rows * (thumb_h + label_h), cols * thumb_w, 3), 245, dtype=np.uint8)
+
+    for idx, path in enumerate(paths, 1):
+        img = read_image(path)
+        if img is None:
+            img = np.zeros((thumb_h, thumb_w, 3), dtype=np.uint8)
+        img = cv2.resize(img, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+        row = (idx - 1) // cols
+        col = (idx - 1) % cols
+        y = row * (thumb_h + label_h)
+        x = col * thumb_w
+        sheet[y : y + thumb_h, x : x + thumb_w] = img
+        cv2.rectangle(sheet, (x, y), (x + thumb_w - 1, y + thumb_h + label_h - 1), (60, 60, 60), 1)
+        cv2.rectangle(sheet, (x + 4, y + 4), (x + 58, y + 38), (0, 0, 0), -1)
+        cv2.putText(sheet, f"{idx:02d}", (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+        cards = " ".join(cards_from_capture_name(path)) or "-"
+        cv2.putText(sheet, cards, (x + 8, y + thumb_h + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1)
+
+    save_debug_image(CALIBRATION_REVIEW, sheet)
+    print("Indeks låst. Send meg nummer + riktige kort, f.eks. '03 = JS 4S'.")
+    print(CALIBRATION_REVIEW)
+    return list_captures(str(limit))
+
+
+def indexed_capture_paths():
+    if not CALIBRATION_INDEX.exists():
+        return []
+    try:
+        raw_paths = json.loads(CALIBRATION_INDEX.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    paths = [Path(path) for path in raw_paths]
+    return [path for path in paths if path.exists()]
+
+
+def calibrate_from_index(index_text, cards_text):
+    try:
+        index = int(index_text)
+    except ValueError:
+        print("Bruk nummer fra --list-captures, f.eks. --calibrate-index 3 \"JS 4S\"")
+        return 2
+    paths = indexed_capture_paths() or recent_capture_paths(max(20, index))
+    if index < 1 or index > len(paths):
+        print(f"Fant ikke bilde nummer {index}. Kjor --list-captures først.")
+        return 1
+    return calibrate_from_file(str(paths[index - 1]), cards_text)
 
 
 def write_cards(hero_cards, source, error=None):
@@ -697,18 +1010,43 @@ def main():
 
     last_good = None
     last_good_at = 0.0
+    pending_cards = None
+    pending_count = 0
 
     while True:
         try:
             hero_cards, error = read_hero_cards_from_screen()
             now = time.time()
             if hero_cards:
-                last_good = hero_cards
-                last_good_at = now
-                write_cards(hero_cards, "screen_fixed_crop")
+                if hero_cards == last_good:
+                    pending_cards = None
+                    pending_count = 0
+                    last_good_at = now
+                    write_cards(hero_cards, "screen_fixed_crop")
+                else:
+                    if hero_cards == pending_cards:
+                        pending_count += 1
+                    else:
+                        pending_cards = hero_cards
+                        pending_count = 1
+
+                    if pending_count >= 2:
+                        last_good = hero_cards
+                        last_good_at = now
+                        pending_cards = None
+                        pending_count = 0
+                        write_cards(hero_cards, "screen_fixed_crop")
+                    elif last_good and now - last_good_at <= 4.0:
+                        write_cards(last_good, "screen_last_good", f"confirming_new_read={hero_cards!r}")
+                    else:
+                        write_cards("", "screen_error", f"confirming_new_read={hero_cards!r}")
             elif last_good and now - last_good_at <= 2.0 and "left=''" not in (error or ""):
+                pending_cards = None
+                pending_count = 0
                 write_cards(last_good, "screen_last_good", error)
             else:
+                pending_cards = None
+                pending_count = 0
                 write_cards("", "screen_error", error)
         except KeyboardInterrupt:
             raise
@@ -720,4 +1058,21 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "--calibrate":
         raise SystemExit(calibrate_from_current_screen(" ".join(sys.argv[2:])))
+    if len(sys.argv) >= 2 and sys.argv[1] in ("--capture-calibrate", "--snap-calibrate"):
+        cards_text = " ".join(sys.argv[2:]) if len(sys.argv) >= 3 else None
+        raise SystemExit(capture_then_calibrate(cards_text))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--calibrate-capture":
+        raise SystemExit(calibrate_from_saved_capture(" ".join(sys.argv[2:])))
+    if len(sys.argv) >= 3 and sys.argv[1] == "--calibrate-latest":
+        raise SystemExit(calibrate_from_latest(" ".join(sys.argv[2:])))
+    if len(sys.argv) >= 4 and sys.argv[1] == "--calibrate-file":
+        raise SystemExit(calibrate_from_file(sys.argv[2], " ".join(sys.argv[3:])))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--list-captures":
+        limit_text = sys.argv[2] if len(sys.argv) >= 3 else None
+        raise SystemExit(list_captures(limit_text))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--review-captures":
+        limit_text = sys.argv[2] if len(sys.argv) >= 3 else None
+        raise SystemExit(review_captures(limit_text))
+    if len(sys.argv) >= 4 and sys.argv[1] == "--calibrate-index":
+        raise SystemExit(calibrate_from_index(sys.argv[2], " ".join(sys.argv[3:])))
     main()

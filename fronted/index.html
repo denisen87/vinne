@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="no">
 <head>
+<meta charset="UTF-8">
 <style>
   table.profile {
     border-collapse: collapse;
@@ -30,10 +31,26 @@
   .muted {
     opacity: 0.7;
   }
+
+  .section-toggle-btn {
+    margin-left: auto;
+    padding: 4px 8px;
+    border: 1px solid #ddd;
+    background: #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+
+  .section-toggle-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
 </style>
 
 
-  <meta charset="UTF-8">
   <title>Poker Equity Calculator</title>
 </head>
 <body>
@@ -45,7 +62,7 @@
 
   <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
     <label>Backend:
-      <input id="apiBase" type="text" value="http://127.0.0.1:8011" style="width:240px;">
+      <input id="apiBase" type="text" value="http://127.0.0.1:8000" style="width:240px;">
     </label>
 
     <label>Session:
@@ -323,10 +340,50 @@
         <input type="text" id="hero" placeholder="Ah Kh" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px;" onchange="handleCardInput()">
       </label>
 
+      <div style="margin-bottom:12px; padding:10px; border:1px solid #ddd; background:#fff; border-radius:6px;">
+        <div style="font-weight:600; margin-bottom:8px;">Hero-register</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+          <input type="text" id="heroRegisterInput" placeholder="Lim inn hero: Ah Kh" style="flex:1; min-width:180px; padding:7px; border:1px solid #ccc; border-radius:4px;">
+          <button id="heroRegisterBtn" type="button">Registrer hero</button>
+          <button id="heroClipboardBtn" type="button">Les utklipp</button>
+          <button id="heroSendLiveMotBtn" type="button">Send til live mot</button>
+        </div>
+        <div id="heroPasteZone" tabindex="0" style="margin-top:8px; padding:8px; border:1px dashed #aaa; border-radius:4px; background:#fafafa; font-size:12px; outline:none;">
+          Klikk her og trykk Ctrl+V fra Utklippsverktøy / Teksthandlinger.
+        </div>
+        <div id="heroClipboardPreview" style="display:none; margin-top:8px;">
+          <div style="font-size:11px; opacity:.7; margin-bottom:4px;">Innlimt bilde</div>
+          <img id="heroClipboardImage" alt="Innlimt hero-utklipp" style="max-width:100%; max-height:180px; border:1px solid #ddd; border-radius:4px; background:#111;">
+        </div>
+        <div id="heroCorrectionBox" style="display:none; margin-top:8px; padding:8px; border:1px solid #e5e7eb; background:#fafafa; border-radius:4px;"></div>
+        <div id="heroRegisterStatus" style="font-size:11px; opacity:.65; margin-top:6px;">Klar.</div>
+      </div>
+
       <label style="display:block; margin-bottom:10px;">
         <div style="font-size:12px; opacity:.7; margin-bottom:4px;">Board (valgfri, f.eks: Qs Jd 2c)</div>
         <input type="text" id="board" placeholder="Qs Jd 2c" style="width:100%; padding:8px; border:1px solid #ccc; border-radius:4px;" onchange="handleCardInput()">
       </label>
+
+      <div style="margin-bottom:12px; padding:10px; border:1px solid #ddd; background:#fff; border-radius:6px;">
+        <div style="font-weight:600; margin-bottom:8px;">Board-register</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+          <input type="text" id="boardRegisterInput" placeholder="Lim inn board: Qs Jd 2c" style="flex:1; min-width:180px; padding:7px; border:1px solid #ccc; border-radius:4px;">
+          <button id="boardRegisterBtn" type="button">Registrer board</button>
+          <button id="boardClipboardBtn" type="button">Les utklipp</button>
+          <button id="boardUseLiveBtn" type="button">Hent live board</button>
+          <button id="boardSendLiveMotBtn" type="button">Send til live mot</button>
+          <button id="boardCopyBtn" type="button">Kopier board</button>
+        </div>
+        <div id="boardPasteZone" tabindex="0" style="margin-top:8px; padding:8px; border:1px dashed #aaa; border-radius:4px; background:#fafafa; font-size:12px; outline:none;">
+          Klikk her og trykk Ctrl+V fra Utklippsverktøy / Teksthandlinger.
+        </div>
+        <div id="boardClipboardPreview" style="display:none; margin-top:8px;">
+          <div style="font-size:11px; opacity:.7; margin-bottom:4px;">Innlimt bilde</div>
+          <img id="boardClipboardImage" alt="Innlimt board-utklipp" style="max-width:100%; max-height:180px; border:1px solid #ddd; border-radius:4px; background:#111;">
+        </div>
+        <div id="boardCorrectionBox" style="display:none; margin-top:8px; padding:8px; border:1px solid #e5e7eb; background:#fafafa; border-radius:4px;"></div>
+        <div id="boardRegisterStatus" style="font-size:11px; opacity:.65; margin-top:6px;">Klar.</div>
+      </div>
 
       <label style="display:block; margin-bottom:12px;">
         <div style="font-size:12px; opacity:.7; margin-bottom:4px;">Antall motspillere</div>
@@ -411,7 +468,6 @@
   <div id="compareOut" style="margin-top:10px;"></div>
 </section>
 
-  <script src="script.js?v=hand-viewer-live-players-poll-20260616b"></script>
 <div class="tabPage" data-tab="insights" style="display:none;">
   <h2>Session Insights</h2>
   <label>min_hands:
@@ -477,5 +533,6 @@
 </div>
 
 
+  <script src="script.js?v=copy-live-capture-20260624a"></script>
 </body>
 </html>

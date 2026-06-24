@@ -8,7 +8,7 @@ from sqlalchemy import text
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-WATCH_DIR = Path(r"C:\Users\denis\AppData\Local\Betsolid Poker\data\angryshark\History\Data\Tables")
+WATCH_DIR = Path(r"C:\Users\denis\AppData\Local\Betsolid Poker\data\angryshark\History\Data")
 API_URL = "http://127.0.0.1:8000/import/betsolid"
 CURRENT_GAME_FILE = Path(__file__).parent / "current_game.json"
 
@@ -121,13 +121,21 @@ class Handler(FileSystemEventHandler):
         LAST_SENT[key] = now
 
 
+def import_recent_existing_files(handler: Handler, limit: int = 8) -> None:
+    files = [p for p in WATCH_DIR.rglob("*.xml") if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files[:limit]:
+        handler._handle(str(p))
+
+
 def main():
     if not WATCH_DIR.exists():
         raise SystemExit(f"Folder not found: {WATCH_DIR}")
 
     event_handler = Handler()
+    import_recent_existing_files(event_handler)
     observer = Observer()
-    observer.schedule(event_handler, str(WATCH_DIR), recursive=False)
+    observer.schedule(event_handler, str(WATCH_DIR), recursive=True)
     observer.start()
 
     print(f"Watching: {WATCH_DIR}")

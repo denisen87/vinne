@@ -22,6 +22,19 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
+function extractCaptureName(text) {
+  const m = String(text || "").match(/capture=([^;)\s]+\.png)/i);
+  return m ? m[1] : "";
+}
+
+function renderLiveStatusWithCapture(text) {
+  const capture = extractCaptureName(text);
+  if (!capture) return escapeHtml(text);
+  const before = text.slice(0, text.indexOf(`capture=${capture}`));
+  const after = text.slice(text.indexOf(`capture=${capture}`) + `capture=${capture}`.length);
+  return `${escapeHtml(before)}capture=<code style="user-select:all; background:#fff7ed; border:1px solid #fed7aa; border-radius:4px; padding:1px 4px;">${escapeHtml(capture)}</code><button type="button" id="copyLiveCapture" data-capture="${escapeHtml(capture)}" title="Kopier capture-filnavn" style="margin-left:6px; padding:2px 8px; border:1px solid #d6d3d1; background:#fff; border-radius:4px; cursor:pointer; font-size:11px;">Kopier</button>${escapeHtml(after)}`;
+}
+
 function apiBase() {
   // Dashboard input if you have it; else fallback to backend
   return $("apiBase")?.value?.trim() || "http://127.0.0.1:8000";
@@ -37,6 +50,8 @@ let manualLiveMode = false;
 let liveScreenActive = false;
 let lastLiveHeroText = "";
 let lastLiveBoardText = "";
+let lastManualBoardText = "";
+let lastLiveCardsStatus = "Livekort: ikke lest ennå.";
 let pendingScreenHeroText = "";
 let pendingScreenHeroCount = 0;
 let startingHandsInFlight = false;
@@ -56,6 +71,12 @@ let ppPickerTarget = "hero";
 let ppHeroCards = [];
 let ppBoardCards = [];
 let ppEquityManualMode = false;
+let ppLastDecisionState = null;
+let backendCardHistory = [];
+let backendCardHistoryLoadedAt = 0;
+let backendCardHistoryInFlight = false;
+let backendCardHistoryError = "";
+const BACKEND_CARD_HISTORY_TTL_MS = 3000;
 
 function dashSessionId() {
   const v = $("dashSession")?.value?.trim();
@@ -68,6 +89,19 @@ function dashHero() {
 function setDashStatus(t) {
   const el = $("dashStatus");
   if (el) el.innerText = t || "";
+}
+
+function syncActiveSessionFields(sessionId, source = "live") {
+  const value = String(sessionId || "").trim();
+  if (!value || !Number.isInteger(Number(value)) || Number(value) <= 0) return false;
+  ["dashSession", "lhSession", "mtSession", "spSession", "ppSession", "shSession"].forEach(id => {
+    const el = $(id);
+    if (el) el.value = value;
+  });
+  lastGameState.session_id = value;
+  const status = $("dashStatus");
+  if (status) status.innerText = `Aktiv session ${value} (${source})`;
+  return true;
 }
 
 function mergeKnownPlayerNames(names) {
@@ -173,6 +207,158 @@ function setProfileEquityStatus(text) {
   if (el) el.innerText = text || "";
 }
 
+function profileNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function stagePressureMultiplier(stage) {
+  if (stage === "river") return 1.08;
+  if (stage === "turn") return 1.03;
+  if (stage === "flop") return 0.98;
+  return 0.95;
+}
+
+function profileHistoryMatchSignal(heroCards, boardCards) {
+  const hero = (heroCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+  const board = (boardCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+  if (hero.length !== 2 || !board.length) {
+    return { sameHeroHands: 0, hitHands: 0, currentHits: 0, hitRate: 0 };
+  }
+  const heroKey = heroComboKey(hero);
+  const boardRanks = new Set(board.map(card => card[0]));
+  const currentHits = hero.filter(card => boardRanks.has(card[0])).length;
+  let sameHeroHands = 0;
+  let hitHands = 0;
+  combinedCardHistory().forEach(entry => {
+    const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+    if (entryHero.length !== 2 || heroComboKey(entryHero) !== heroKey) return;
+    const entryBoard = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+    if (!entryBoard.length) return;
+    sameHeroHands += 1;
+    const ranks = new Set(entryBoard.map(card => card[0]));
+    if (hero.some(card => ranks.has(card[0]))) hitHands += 1;
+  });
+  return {
+    sameHeroHands,
+    hitHands,
+    currentHits,
+    hitRate: sameHeroHands ? hitHands / sameHeroHands : 0
+  };
+}
+
+function buildProfileDecision(data) {
+  const winPct = profileNumber(data?.winPct, 0);
+  const tiePct = profileNumber(data?.tiePct, 0);
+  const equity = winPct + (tiePct * 0.5);
+  const pot = Math.max(0, profileNumber($("ppPotChips")?.value, 0));
+  const call = Math.max(0, profileNumber($("ppCallChips")?.value, 0));
+  const stack = Math.max(0, profileNumber($("ppStackChips")?.value, 0));
+  const betPct = stack > 0 && call > 0 ? (call / stack) * 100 : 0;
+  const potOdds = call > 0 ? (call / Math.max(pot + call, 1)) * 100 : 0;
+  const stage = data?.stage || "preflop";
+  const profile = data?.profile || {};
+  const strength = profileNumber(profile.strength_score, 50);
+  const aggression = profileNumber(profile.aggression_score, 50);
+  const fundamentals = profileNumber(profile.fundamentals_score, 50);
+  const sampleHands = profileNumber(profile.results?.hands, 0);
+  const sampleWeight = Math.min(1, sampleHands / 50);
+  const historySignal = data?.historySignal || profileHistoryMatchSignal(data?.heroCards, data?.boardCards);
+
+  let required = potOdds * stagePressureMultiplier(stage);
+  required += ((strength - 50) / 100) * 5 * sampleWeight;
+  required += ((fundamentals - 50) / 100) * 2 * sampleWeight;
+  required -= ((aggression - 50) / 100) * 3 * sampleWeight;
+  if (betPct >= 35) required += 5;
+  else if (betPct >= 20) required += 2.5;
+  else if (betPct > 0 && betPct <= 8) required -= 1.5;
+  if (historySignal.currentHits > 0 && historySignal.sameHeroHands >= 5) {
+    required -= Math.min(3, historySignal.hitRate * 4);
+  }
+  required = Math.max(0, Math.min(95, required));
+
+  const edge = equity - required;
+  let action = "CALL";
+  let color = "#b45309";
+  let tone = "#fffbeb";
+  let confidence = Math.min(95, Math.max(35, Math.round(Math.abs(edge) * 5 + sampleWeight * 20)));
+  let reason = "Tett spot: equity er nær kravet fra pot-odds og profil.";
+
+  if (!call) {
+    if (equity >= 58 && aggression < 70) {
+      action = "BET";
+      color = "#15803d";
+      tone = "#ecfdf5";
+      reason = "Ingen call-pris satt. Equity er sterk nok til value/semi-bluff mot profilen.";
+    } else if (equity >= 50) {
+      action = "CALL";
+      reason = "Ingen call-pris satt. Ta billig showdown/check-call oftere enn å bygge stor pot.";
+    } else {
+      action = "FOLD";
+      color = "#b91c1c";
+      tone = "#fef2f2";
+      reason = "Ingen call-pris satt og equity er lav mot range/profil.";
+    }
+  } else if (edge >= 8) {
+    action = "BET";
+    color = "#15803d";
+    tone = "#ecfdf5";
+    reason = "Equity ligger tydelig over kravet. Bet/raise er ok når sizing ikke er for stor.";
+  } else if (edge >= -3) {
+    action = "CALL";
+    color = "#b45309";
+    tone = "#fffbeb";
+    reason = "Equity er nær pot-odds. Call er best før mer informasjon.";
+  } else {
+    action = "FOLD";
+    color = "#b91c1c";
+    tone = "#fef2f2";
+    reason = "Equity ligger under kravet når pot-odds, sizing og profil vektes sammen.";
+  }
+
+  return {
+    action, color, tone, confidence, reason,
+    equity, required, edge, pot, call, stack, betPct, potOdds,
+    profileText: `styrke ${Math.round(strength)}, aggro ${Math.round(aggression)}, sample ${sampleHands}`,
+    historyText: historySignal.sameHeroHands
+      ? `${historySignal.hitHands}/${historySignal.sameHeroHands} samme hero-hender traff board`
+      : "ingen samme hero-historikk"
+  };
+}
+
+function renderProfileDecisionPanel() {
+  const out = $("ppDecisionOut");
+  if (!out) return;
+  if (!ppLastDecisionState) {
+    out.innerHTML = `<div style="opacity:.65;">Beregn equity først. Fyll pot/call/stack for pot-odds.</div>`;
+    return;
+  }
+  const d = buildProfileDecision(ppLastDecisionState);
+  out.innerHTML = `
+    <div style="border:1px solid #ddd; background:${d.tone}; padding:10px; border-radius:6px;">
+      <div style="display:flex; justify-content:space-between; gap:10px; align-items:center;">
+        <div>
+          <div style="font-size:11px; opacity:.65;">Forslag</div>
+          <div style="font-size:24px; font-weight:900; color:${d.color};">${escapeHtml(d.action)}</div>
+        </div>
+        <div style="text-align:right; font-size:12px;">
+          <div><b>Equity:</b> ${d.equity.toFixed(1)}%</div>
+          <div><b>Krav:</b> ${d.required.toFixed(1)}%</div>
+          <div><b>Edge:</b> ${d.edge >= 0 ? "+" : ""}${d.edge.toFixed(1)}%</div>
+        </div>
+      </div>
+      <div style="margin-top:8px; font-size:12px; line-height:1.35;">${escapeHtml(d.reason)}</div>
+      <div style="margin-top:6px; font-size:11px; opacity:.72;">
+        Call/bet: ${d.call.toLocaleString()} chips (${d.betPct.toFixed(1)}% av stack) |
+        Pot odds: ${d.potOdds.toFixed(1)}% |
+        Profil: ${escapeHtml(d.profileText)} |
+        Historikk: ${escapeHtml(d.historyText)} |
+        Konfidens: ${d.confidence}%
+      </div>
+    </div>
+  `;
+}
+
 async function syncProfileEquityLiveCards(opts = {}) {
   const heroEl = $("ppHeroCards");
   const boardEl = $("ppBoardCards");
@@ -215,14 +401,20 @@ async function calculateProfileEquity(opts = {}) {
   const all = heroCards.concat(boardCards);
 
   if (heroCards.length !== 2 || !heroCards.every(isCard)) {
+    ppLastDecisionState = null;
+    renderProfileDecisionPanel();
     out.innerHTML = `<div style="opacity:.7;">Venter på 2 gyldige hero-kort.</div>`;
     return;
   }
   if (boardCards.length > 5 || !boardCards.every(isCard)) {
+    ppLastDecisionState = null;
+    renderProfileDecisionPanel();
     out.innerHTML = `<div style="color:#b91c1c;">Board kan ha maks 5 gyldige kort.</div>`;
     return;
   }
   if (new Set(all).size !== all.length) {
+    ppLastDecisionState = null;
+    renderProfileDecisionPanel();
     out.innerHTML = `<div style="color:#b91c1c;">Samme kort finnes flere steder.</div>`;
     return;
   }
@@ -264,10 +456,25 @@ async function calculateProfileEquity(opts = {}) {
       </div>
       <div style="margin-top:4px; font-size:12px; opacity:.75;"><b>Range:</b> ${escapeHtml(rangeText || "random")}</div>
     `;
+    ppLastDecisionState = {
+      winPct: win,
+      tiePct: tie,
+      losePct: lose,
+      stage,
+      heroCards,
+      boardCards,
+      rangeText,
+      player,
+      historySignal: profileHistoryMatchSignal(heroCards, boardCards),
+      profile: playerProfileData || {}
+    };
+    renderProfileDecisionPanel();
     setProfileEquityStatus("OK");
   } catch (e) {
     console.error(e);
     setProfileEquityStatus("Feil");
+    ppLastDecisionState = null;
+    renderProfileDecisionPanel();
     out.innerHTML = `<div style="color:#b91c1c;">Klarte ikke beregne equity.</div>`;
   }
 }
@@ -335,6 +542,8 @@ function clearProfileEquityCards() {
   ppPickerTarget = "hero";
   syncProfileEquityInputs([], []);
   lastPlayerProfileEquityKey = "";
+  ppLastDecisionState = null;
+  renderProfileDecisionPanel();
   renderProfileEquityCardPicker();
 
   const out = $("ppEquityOut");
@@ -397,10 +606,7 @@ function syncCurrentHandFeatureInputs(data) {
   const player = chooseAutoFeaturePlayer(data?.players || []);
 
   if (sessionId) {
-    ["dashSession", "lhSession", "mtSession", "spSession", "ppSession"].forEach(id => {
-      const el = $(id);
-      if (el) el.value = String(sessionId);
-    });
+    syncActiveSessionFields(sessionId, data?.session_id ? "latest-hand" : "ui");
   }
 
   if (player) {
@@ -470,6 +676,7 @@ function parseCards(text) {
 
 function convertBetSolidCard(card) {
   if (!card || card.length < 2) return card;
+  card = String(card).trim();
 
   const standard = card[0].toUpperCase() + card.slice(1).toLowerCase();
   if (/^[2-9TJQKA][shdc]$/.test(standard)) return standard;
@@ -481,8 +688,8 @@ function convertBetSolidCard(card) {
     C: "c"
   };
 
-  const suit = suitMap[card[0]];
-  let rank = card.substring(1);
+  const suit = suitMap[card[0].toUpperCase()];
+  let rank = card.substring(1).toUpperCase();
 
   // Treys bruker T, ikke 10
   if (rank === "10") rank = "T";
@@ -496,6 +703,7 @@ function convertBetSolidCard(card) {
 // Card history (localStorage)
 // ------------------------------
 const CARD_HISTORY_KEY = "cardHistoryV1";
+const HERO_BOARD_MATCH_HISTORY_KEY = "heroBoardMatchHistoryV1";
 function loadCardHistory() {
   try {
     const raw = localStorage.getItem(CARD_HISTORY_KEY);
@@ -513,17 +721,62 @@ function saveCardHistory(list) {
     console.warn("Failed to save card history", e);
   }
 }
+function loadHeroBoardMatchHistory() {
+  try {
+    const raw = localStorage.getItem(HERO_BOARD_MATCH_HISTORY_KEY);
+    if (!raw) return [];
+    return JSON.parse(raw);
+  } catch (e) {
+    console.warn("Failed to load hero-board match history", e);
+    return [];
+  }
+}
+function saveHeroBoardMatchHistoryList(list) {
+  try {
+    localStorage.setItem(HERO_BOARD_MATCH_HISTORY_KEY, JSON.stringify(list));
+  } catch (e) {
+    console.warn("Failed to save hero-board match history", e);
+  }
+}
+function liveBoardFallbackCards() {
+  const sources = [
+    lastLiveBoardText,
+    lastGameState?.board,
+    $("boardRegisterInput")?.value,
+    $("board")?.value,
+    $("ppBoardCards")?.value,
+    lastManualBoardText
+  ];
+  for (const raw of sources) {
+    const cards = parseCards(raw || "").filter(isCard).slice(0, 5);
+    if (cards.length) return cards;
+  }
+  return [];
+}
 function normalizeHistoryEntry(e) {
   return {
     ...e,
     hero: Array.isArray(e?.hero) ? e.hero.map(convertBetSolidCard) : [],
     board: Array.isArray(e?.board) ? e.board.map(convertBetSolidCard) : [],
+    showdown_class: e?.showdown_class || e?.hand_class || "",
+    showdown_rank_class: e?.showdown_rank_class ?? e?.rank_class ?? null,
     at: e?.at || Date.now()
   };
 }
 function cardHistoryKey(e) {
   const n = normalizeHistoryEntry(e);
-  return `${n.hero.join("|")}::${n.board.join("|")}`;
+  if (n.hand_id) return `hand:${n.hand_id}`;
+  if (n.site_hand_id) return `site:${n.site_hand_id}`;
+  const heroKey = n.hero
+    .filter(isCard)
+    .slice(0, 2)
+    .sort()
+    .join("|");
+  const boardKey = n.board
+    .filter(isCard)
+    .slice(0, 5)
+    .join("|");
+  return `${heroKey}::${boardKey}`;
 }
 function dedupeCardHistory(list) {
   const seen = new Set();
@@ -536,20 +789,300 @@ function dedupeCardHistory(list) {
     seen.add(key);
     out.push(entry);
   }
-  return out;
+  return out.sort((a, b) => {
+    const atDiff = Number(b.at || 0) - Number(a.at || 0);
+    if (atDiff) return atDiff;
+    return Number(b.hand_id || 0) - Number(a.hand_id || 0);
+  });
+}
+
+function normalizeHeroBoardMatchEntry(e) {
+  const hero = (e?.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+  const board = (e?.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+  const heroRanks = [...new Set(hero.map(card => card[0]))];
+  const boardRanks = new Set(board.map(card => card[0]));
+  const hits = heroRanks.filter(rank => boardRanks.has(rank));
+  return {
+    ...e,
+    hero,
+    board,
+    hero_ranks: heroRanks,
+    board_ranks: [...boardRanks],
+    hits,
+    misses: heroRanks.filter(rank => !boardRanks.has(rank)),
+    any_hit: hits.length > 0,
+    both_hit: heroRanks.length > 0 && hits.length === heroRanks.length,
+    at: e?.at || Date.now()
+  };
+}
+function heroBoardMatchHistoryKey(e) {
+  const n = normalizeHeroBoardMatchEntry(e);
+  if (n.hand_id) return `hand:${n.hand_id}`;
+  if (n.site_hand_id) return `site:${n.site_hand_id}`;
+  return `${n.hero.map(c => c[0]).sort().join("|")}::${n.board.join("|")}`;
+}
+function dedupeHeroBoardMatchHistory(list) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of list || []) {
+    const entry = normalizeHeroBoardMatchEntry(raw);
+    if (entry.hero.length !== 2 || !entry.board.length || !entry.hits.length) continue;
+    const key = heroBoardMatchHistoryKey(entry);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(entry);
+  }
+  return out.sort((a, b) => {
+    const atDiff = Number(b.at || 0) - Number(a.at || 0);
+    if (atDiff) return atDiff;
+    return Number(b.hand_id || 0) - Number(a.hand_id || 0);
+  });
+}
+
+function normalizeBackendCardHistoryEntry(entry, index = null) {
+  const cards = Array.isArray(entry?.cards) ? entry.cards : entry?.hero;
+  const started = entry?.started_at ? Date.parse(entry.started_at) : NaN;
+  return normalizeHistoryEntry({
+    hero: (cards || []).map(convertBetSolidCard),
+    board: (entry?.board || []).map(convertBetSolidCard),
+    at: Number.isFinite(started) ? started : Date.now(),
+    hand_id: entry?.hand_id,
+    site_hand_id: entry?.site_hand_id,
+    session_id: entry?.session_id,
+    showdown_class: entry?.showdown_class || entry?.hand_class || "",
+    showdown_rank_class: entry?.showdown_rank_class ?? entry?.rank_class ?? null,
+    overall_index: index,
+    source: "backend"
+  });
+}
+
+function combinedCardHistory() {
+  const localHistory = loadCardHistory();
+  const usableLocalHistory = backendCardHistory.length ? [] : localHistory;
+  return dedupeCardHistory([
+    ...backendCardHistory,
+    ...usableLocalHistory
+  ].map(normalizeHistoryEntry).sort((a, b) => Number(b.at || 0) - Number(a.at || 0)));
+}
+
+async function refreshBackendCardHistory(opts = {}) {
+  const now = Date.now();
+  if (!opts.force && backendCardHistoryLoadedAt && now - backendCardHistoryLoadedAt < BACKEND_CARD_HISTORY_TTL_MS) {
+    return backendCardHistory;
+  }
+  if (backendCardHistoryInFlight) return backendCardHistory;
+  backendCardHistoryInFlight = true;
+  backendCardHistoryError = "";
+  try {
+    const params = new URLSearchParams();
+    const heroName = dashHero();
+    if (heroName) params.set("player_name", heroName);
+    params.set("limit", String(opts.limit || 200));
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), opts.timeoutMs || 5000);
+    let res;
+    try {
+      res = await fetch(`${apiBase()}/hands/card-history?${params.toString()}`, { signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    backendCardHistory = (data.history || [])
+      .map((entry, index) => normalizeBackendCardHistoryEntry(entry, index))
+      .filter(e => e.hero.length === 2);
+    backendCardHistoryLoadedAt = Date.now();
+    backendCardHistory.forEach(entry => {
+      if (entry.board && entry.board.length) {
+        saveHeroBoardMatchHistory(entry.hero, entry.board, entry.source || "backend", entry);
+      }
+    });
+    renderHeroHistoryMatches({ skipBackendRefresh: true });
+  } catch (e) {
+    backendCardHistoryError = e?.name === "AbortError" ? "timeout" : String(e?.message || e);
+    console.warn("Could not load backend card history", e);
+  } finally {
+    backendCardHistoryInFlight = false;
+  }
+  return backendCardHistory;
 }
 
 function heroComboKey(cards) {
-  return (cards || []).map(convertBetSolidCard).filter(isCard).slice(0, 2).sort().join("|");
+  return (cards || [])
+    .map(convertBetSolidCard)
+    .filter(isCard)
+    .slice(0, 2)
+    .map(card => card[0])
+    .sort()
+    .join("|");
+}
+
+function activeHistorySessionId() {
+  const candidates = [
+    lastGameState?.session_id,
+    lastLiveCardsMeta?.session_id,
+    $("shSession")?.value,
+    $("dashSession")?.value,
+    $("lhSession")?.value
+  ];
+  for (const raw of candidates) {
+    const value = String(raw || "").trim();
+    if (value && Number.isInteger(Number(value)) && Number(value) > 0) return value;
+  }
+  return "";
 }
 
 function roundsSinceLabel(index) {
   return index === 0 ? "forrige runde" : `${index + 1} runder siden`;
 }
 
-function renderHeroHistoryMatches() {
+function matchSummaryWithLabel(indexes, labelFn) {
+  const list = indexes || [];
+  if (!list.length) {
+    return { latest: "-", recent: "-", extra: 0 };
+  }
+  const shown = list.slice(0, 5).map(labelFn);
+  const extra = Math.max(0, list.length - shown.length);
+  return {
+    latest: labelFn(list[0]),
+    recent: `${shown.join(", ")}${extra ? `, +${extra} flere` : ""}`,
+    extra
+  };
+}
+
+function historyMatchSummary(indexes) {
+  return matchSummaryWithLabel(indexes, roundsSinceLabel);
+}
+
+function sameHeroSinceLabel(index) {
+  if (index === 0) return "nyeste samme hero";
+  if (index === 1) return "forrige samme hero";
+  return `${index + 1}. nyeste samme hero`;
+}
+
+function simpleMatchAgeLabel(index) {
+  const rounds = Number(index || 0) + 1;
+  return rounds === 1 ? "1 runde siden" : `${rounds} runder siden`;
+}
+
+function sameHeroMatchSummary(indexes) {
+  return matchSummaryWithLabel(indexes, sameHeroSinceLabel);
+}
+
+function sameHeroHitSummary(matches) {
+  const list = matches || [];
+  if (!list.length) {
+    return { latest: "-", recent: "", extra: 0 };
+  }
+  const shown = list.slice(0, 5).map(item => `${item.hit} ${simpleMatchAgeLabel(item.historyIndex ?? item.index)}`);
+  const extra = Math.max(0, list.length - shown.length);
+  return {
+    latest: simpleMatchAgeLabel(list[0].historyIndex ?? list[0].index),
+    recent: `${shown.join(", ")}${extra ? `, +${extra} flere` : ""}`,
+    extra
+  };
+}
+
+function sameHeroBoardSummary(matches) {
+  const list = matches || [];
+  if (!list.length) {
+    return { latest: "-", recent: "", extra: 0 };
+  }
+  const shown = list.slice(0, 5).map(item => `${item.rank} ${simpleMatchAgeLabel(item.historyIndex ?? item.index)}`);
+  const extra = Math.max(0, list.length - shown.length);
+  return {
+    latest: simpleMatchAgeLabel(list[0].historyIndex ?? list[0].index),
+    recent: `${shown.join(", ")}${extra ? `, +${extra} flere` : ""}`,
+    extra
+  };
+}
+
+const MADE_HAND_ORDER = [
+  "Straight Flush",
+  "Four of a Kind",
+  "Full House",
+  "Flush",
+  "Straight",
+  "Three of a Kind",
+  "Two Pair",
+  "Pair",
+  "High Card"
+];
+
+function madeHandLabel(name) {
+  const labels = {
+    "Straight Flush": "Straight flush",
+    "Four of a Kind": "Fire like",
+    "Full House": "Hus",
+    "Flush": "Flush",
+    "Straight": "Straight",
+    "Three of a Kind": "Trips",
+    "Two Pair": "To par",
+    "Pair": "Par",
+    "High Card": "High card"
+  };
+  return labels[name] || name || "-";
+}
+
+function madeHandTone(name, count) {
+  if (!count) return "#fff";
+  if (["Straight Flush", "Four of a Kind", "Full House", "Flush", "Straight"].includes(name)) return "#ecfdf5";
+  if (["Three of a Kind", "Two Pair"].includes(name)) return "#eff6ff";
+  return "#fff7ed";
+}
+
+function heroRankMadeHandSignals(heroCards, boardCards) {
+  const hero = (heroCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+  const board = (boardCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+  if (hero.length !== 2 || !board.length) return [];
+
+  const heroCounts = {};
+  const boardCounts = {};
+  const heroSuitCounts = {};
+  const boardSuitCounts = {};
+  hero.forEach(card => { heroCounts[card[0]] = (heroCounts[card[0]] || 0) + 1; });
+  board.forEach(card => { boardCounts[card[0]] = (boardCounts[card[0]] || 0) + 1; });
+  hero.forEach(card => { heroSuitCounts[card[1]] = (heroSuitCounts[card[1]] || 0) + 1; });
+  board.forEach(card => { boardSuitCounts[card[1]] = (boardSuitCounts[card[1]] || 0) + 1; });
+
+  const signals = [];
+  Object.keys(heroCounts).forEach(rank => {
+    const boardCount = boardCounts[rank] || 0;
+    if (!boardCount) return;
+    const total = heroCounts[rank] + boardCount;
+    if (total >= 4) {
+      signals.push({ name: "Four of a Kind", rank });
+      signals.push({ name: "Three of a Kind", rank });
+    } else if (total === 3) {
+      signals.push({ name: "Three of a Kind", rank });
+    }
+  });
+  const pairedHeroRanks = Object.keys(heroCounts).filter(rank => (boardCounts[rank] || 0) > 0);
+  if (pairedHeroRanks.length >= 2) {
+    signals.push({ name: "Two Pair", rank: pairedHeroRanks.join("+") });
+  } else if (pairedHeroRanks.length === 1) {
+    const pairedRank = pairedHeroRanks[0];
+    const boardHasOtherPair = Object.keys(boardCounts).some(rank => rank !== pairedRank && boardCounts[rank] >= 2);
+    if (boardHasOtherPair) {
+      signals.push({ name: "Two Pair", rank: pairedRank });
+    }
+  }
+  Object.keys(heroSuitCounts).forEach(suit => {
+    const boardCount = boardSuitCounts[suit] || 0;
+    if (!boardCount) return;
+    if (heroSuitCounts[suit] + boardCount >= 5) {
+      signals.push({ name: "Flush", suit });
+    }
+  });
+  return signals;
+}
+
+function renderHeroHistoryMatches(opts = {}) {
   const box = $("heroHistoryMatchBox");
   if (!box) return;
+  if (!opts.skipBackendRefresh) {
+    refreshBackendCardHistory().catch(console.warn);
+  }
 
   const heroCards = parseCards($("hero")?.value || "").filter(isCard).slice(0, 2);
   if (heroCards.length !== 2) {
@@ -557,93 +1090,352 @@ function renderHeroHistoryMatches() {
     return;
   }
 
-  const list = dedupeCardHistory(loadCardHistory());
+  if (backendCardHistoryInFlight && !backendCardHistory.length) {
+    box.innerHTML = `<div style="opacity:.65;">Historikkmatch: laster database...</div>`;
+    return;
+  }
+
+  const activeSessionId = activeHistorySessionId();
+  const allHistory = combinedCardHistory();
+  const list = allHistory;
   if (!list.length) {
     box.innerHTML = `<div style="opacity:.65;">Historikkmatch: ingen tidligere runder lagret.</div>`;
     return;
   }
 
-  const targetCombo = heroComboKey(heroCards);
-  const cardStats = Object.fromEntries(heroCards.map(card => [card, { count: 0, indexes: [] }]));
-  const comboIndexes = [];
+  const currentBoardCards = liveBoardFallbackCards();
+  const minHistoricalBoardCards = 1;
+  const currentBoardRanks = new Set(currentBoardCards.map(card => card[0]));
+  const currentHeroRanks = [...new Set(heroCards.map(card => card[0]))];
+  const currentHits = currentHeroRanks.map(rank => ({
+    rank,
+    hit: currentBoardRanks.has(rank)
+  }));
+  const currentHitText = currentBoardCards.length
+    ? currentHits.map(item => `${item.rank} ${item.hit ? "matcher" : "matcher ikke"}`).join(", ")
+    : "legg inn board for nå-match";
 
-  list.forEach((entry, idx) => {
+  const heroKey = heroComboKey(heroCards);
+  const heroRanks = [...new Set(heroCards.map(card => card[0]))];
+  const rankStats = Object.fromEntries(heroRanks.map(rank => [rank, { attempts: 0, matches: 0, indexes: [], details: [] }]));
+  const comboIndexes = [];
+  const anyHitIndexes = [];
+  const comboMatches = [];
+  const anyHitMatches = [];
+  const sameHeroHands = [];
+  const olderSameHeroHands = [];
+  let allBoardCount = 0;
+  let sameHeroWithBoardCount = 0;
+
+  list.forEach((entry, historyIndex) => {
     const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
     if (entryHero.length !== 2) return;
-    if (heroComboKey(entryHero) === targetCombo) comboIndexes.push(idx);
-
-    heroCards.forEach(card => {
-      if (entryHero.includes(card)) {
-        cardStats[card].count += 1;
-        cardStats[card].indexes.push(idx);
-      }
+    const entryBoard = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+    if (!entryBoard.length) return;
+    const entryHeroRanks = new Set(entryHero.map(card => card[0]));
+    const boardRanks = new Set(entryBoard.map(card => card[0]));
+    heroRanks.forEach(rank => {
+      if (!entryHeroRanks.has(rank)) return;
+      rankStats[rank].attempts += 1;
+      if (!boardRanks.has(rank)) return;
+      rankStats[rank].matches += 1;
+      rankStats[rank].indexes.push(historyIndex);
+      rankStats[rank].details.push({
+        index: historyIndex,
+        historyIndex,
+        rank,
+        matchedBoard: entryBoard.filter(card => card[0] === rank),
+        source: entry.source || (entry.hand_id ? "database" : "lokal"),
+        hand_id: entry.hand_id || "",
+        site_hand_id: entry.site_hand_id || ""
+      });
     });
   });
 
-  const comboSince = comboIndexes.length
-    ? comboIndexes.slice(0, 6).map(roundsSinceLabel).join(", ")
-    : "-";
+  const collectSameHeroRows = (sourceList, includeStats) => {
+    const rows = [];
+    sourceList.forEach((entry, historyIndex) => {
+    const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+    if (entryHero.length !== 2) return;
 
-  const rows = [
-    {
-      type: "Eksakt hånd",
-      value: heroCards.join(" "),
-      count: comboIndexes.length,
-      since: comboSince
-    },
-    ...heroCards.map(card => {
-    const stats = cardStats[card];
-    const since = stats.indexes.length
-      ? stats.indexes.slice(0, 6).map(roundsSinceLabel).join(", ")
-      : "-";
+    const entryBoard = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+    if (!entryBoard.length) return;
+    if (entryBoard.length < minHistoricalBoardCards) return;
+
+    const boardRanks = new Set(entryBoard.map(card => card[0]));
+    if (includeStats) allBoardCount += 1;
+
+    if (heroComboKey(entryHero) !== heroKey) return;
+
+    const boardIndex = includeStats ? sameHeroWithBoardCount : rows.length;
+    if (includeStats) sameHeroWithBoardCount += 1;
+    const hitRanks = heroRanks.filter(rank => boardRanks.has(rank));
+    const bothHeroRanksOnBoard = heroRanks.every(rank => boardRanks.has(rank));
+    if (includeStats && bothHeroRanksOnBoard) {
+      comboIndexes.push(boardIndex);
+      comboMatches.push({ index: boardIndex, historyIndex, hit: heroRanks.join(" + ") });
+    }
+    if (includeStats && hitRanks.length) {
+      anyHitIndexes.push(boardIndex);
+      anyHitMatches.push({ index: boardIndex, historyIndex, hit: hitRanks.join(" / ") });
+    }
+
+    rows.push({
+      index: boardIndex,
+      historyIndex,
+      label: Number.isInteger(entry.overall_index) ? simpleMatchAgeLabel(entry.overall_index) : sameHeroSinceLabel(boardIndex),
+      hero: entryHero,
+      board: entryBoard,
+      hits: hitRanks,
+      showdown_class: entry.showdown_class || "",
+      showdown_rank_class: entry.showdown_rank_class ?? null,
+      made_hand_signals: heroRankMadeHandSignals(entryHero, entryBoard),
+      source: entry.source || (entry.hand_id ? "database" : "lokal"),
+      hand_id: entry.hand_id || "",
+      site_hand_id: entry.site_hand_id || "",
+      session_id: entry.session_id || "",
+      overall_index: entry.overall_index
+    });
+  });
+    return rows;
+  };
+
+  sameHeroHands.push(...collectSameHeroRows(list, true));
+  const usingAllSessionsForStats = Boolean(activeSessionId && backendCardHistory.length);
+
+  const madeHandStats = {};
+  const addMadeHandStat = (name, row, suffix = "") => {
+    if (!name) return;
+    if (!madeHandStats[name]) {
+      madeHandStats[name] = { name, count: 0, matches: [] };
+    }
+    madeHandStats[name].count += 1;
+    madeHandStats[name].matches.push({
+      index: row.index,
+      historyIndex: row.historyIndex,
+      hero: row.hero,
+      board: row.board,
+      hand_id: row.hand_id,
+      site_hand_id: row.site_hand_id,
+      suffix
+    });
+  };
+  sameHeroHands.forEach(row => {
+    const klass = String(row.showdown_class || "").trim();
+    if (klass) addMadeHandStat(klass, row);
+    (row.made_hand_signals || []).forEach(signal => {
+      if (signal.name === klass) return;
+      addMadeHandStat(signal.name, row, signal.rank ? ` ${signal.rank}` : "");
+    });
+  });
+
+  const anyHitSummary = sameHeroHitSummary(anyHitMatches);
+  const comboSummary = sameHeroHitSummary(comboMatches);
+
+  const rankRows = heroRanks.map(rank => {
+    const stats = rankStats[rank];
+    const summary = sameHeroBoardSummary(stats.details);
       return {
-        type: "Kort",
-        value: card,
-        count: stats.count,
-        since
+        type: `${rank} treff board`,
+        value: `${rank}: ${stats.matches} treff / ${stats.attempts} lagrede boards med ${rank}`,
+        count: stats.matches,
+        latest: summary.latest,
+        since: summary.recent,
+        tone: stats.matches ? "#eff6ff" : "#fff"
       };
-    })
-  ];
+    });
+  const rows = heroRanks.length === 1
+    ? rankRows
+    : [
+      {
+        type: "Minst ett treff",
+        value: heroRanks.join(" / "),
+        count: anyHitIndexes.length,
+        latest: anyHitSummary.latest,
+        since: anyHitSummary.recent,
+        tone: anyHitIndexes.length ? "#fff7ed" : "#fff"
+      },
+      {
+        type: "Begge treff",
+        value: heroRanks.join(" + "),
+        count: comboIndexes.length,
+        latest: comboSummary.latest,
+        since: comboSummary.recent,
+        tone: comboIndexes.length ? "#ecfdf5" : "#fff"
+      },
+      ...rankRows
+    ];
 
   const tableRows = rows.map(row => `
-    <tr>
-      <td style="border-top:1px solid #e5e7eb; padding:5px 6px; opacity:.75;">${escapeHtml(row.type)}</td>
-      <td style="border-top:1px solid #e5e7eb; padding:5px 6px; font-weight:700;">${escapeHtml(row.value)}</td>
-      <td style="border-top:1px solid #e5e7eb; padding:5px 6px; text-align:right;">${row.count}</td>
-      <td style="border-top:1px solid #e5e7eb; padding:5px 6px;">${escapeHtml(row.since)}</td>
+    <tr style="background:${row.tone};">
+      <td style="border-top:1px solid #e5e7eb; padding:7px 8px; opacity:.75;">${escapeHtml(row.type)}</td>
+      <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:800; font-size:13px;">${escapeHtml(row.value)}</td>
+      <td style="border-top:1px solid #e5e7eb; padding:7px 8px; text-align:center; font-weight:800;">${row.count}</td>
+      <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:700;">${escapeHtml(row.latest)}</td>
+      <td style="border-top:1px solid #e5e7eb; padding:7px 8px; line-height:1.35;">${escapeHtml(row.since)}</td>
     </tr>
   `).join("");
 
+  const madeHandRows = MADE_HAND_ORDER
+    .map(name => madeHandStats[name] || { name, count: 0, matches: [] })
+    .map(stat => {
+      const summary = sameHeroHitSummary(stat.matches.map(item => ({
+        hit: `${madeHandLabel(stat.name)}${item.suffix || ""}`,
+        historyIndex: item.historyIndex
+      })));
+      return `
+        <tr style="background:${madeHandTone(stat.name, stat.count)};">
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:800;">${escapeHtml(madeHandLabel(stat.name))}</td>
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; text-align:center; font-weight:800;">${stat.count}</td>
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:700;">${escapeHtml(summary.latest)}</td>
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; line-height:1.35;">${escapeHtml(summary.recent)}</td>
+        </tr>
+      `;
+    }).join("");
+
+  const madeHandTable = `
+    <div style="margin-top:10px; font-weight:800;">Håndtype med samme hero-ranker</div>
+    <div style="margin-top:2px; opacity:.6; font-size:11px;">Viser alle ferdige håndtyper for historiske runder med 5 boardkort. 0 betyr at den håndtypen ikke er funnet ennå.</div>
+    <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff; border:1px solid #e5e7eb; margin-top:5px;">
+      <thead>
+        <tr style="background:#f3f4f6;">
+          <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Håndtype</th>
+          <th style="text-align:center; padding:7px 8px; border-bottom:1px solid #d1d5db;">Antall</th>
+          <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Sist sett</th>
+          <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Siste</th>
+        </tr>
+      </thead>
+      <tbody>${madeHandRows}</tbody>
+    </table>
+  `;
+
+  const historyRows = sameHeroHands.slice(0, 12).map(row => {
+    const hitText = row.hits.length ? row.hits.join(" + ") : "Ingen treff";
+    const madeLabels = [];
+    if (row.showdown_class) madeLabels.push(madeHandLabel(row.showdown_class));
+    (row.made_hand_signals || []).forEach(signal => {
+      const label = signal.rank ? `${madeHandLabel(signal.name)} ${signal.rank}` : madeHandLabel(signal.name);
+      if (!madeLabels.includes(label)) madeLabels.push(label);
+    });
+    const madeText = madeLabels.length ? ` | ${madeLabels.join(" / ")}` : "";
+    const tone = row.hits.length === 2 ? "#ecfdf5" : row.hits.length ? "#eff6ff" : "#fff";
+    const idText = [
+      row.hand_id ? `backend #${row.hand_id}` : row.source,
+      row.site_hand_id ? `BetSolid ${row.site_hand_id}` : ""
+    ].filter(Boolean).join(" / ");
+    return `
+      <tr style="background:${tone};">
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:700;">${escapeHtml(row.label)}</td>
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:800;">${escapeHtml(row.hero.join(" "))}</td>
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px;">${escapeHtml(row.board.join(" "))}</td>
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:800;">${escapeHtml(hitText + madeText)}</td>
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; opacity:.65;">${escapeHtml(idText)}</td>
+      </tr>
+    `;
+  }).join("");
+  const olderHistoryRows = olderSameHeroHands.slice(0, 8).map(row => {
+    const hitText = row.hits.length ? row.hits.join(" + ") : "Ingen treff";
+    const tone = row.hits.length === 2 ? "#f0fdf4" : row.hits.length ? "#f8fafc" : "#fff";
+    const idText = [
+      row.hand_id ? `backend #${row.hand_id}` : row.source,
+      row.site_hand_id ? `BetSolid ${row.site_hand_id}` : "",
+      row.session_id ? `session ${row.session_id}` : ""
+    ].filter(Boolean).join(" / ");
+    return `
+      <tr style="background:${tone}; opacity:.82;">
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:700;">eldre ${escapeHtml(row.label)}</td>
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:800;">${escapeHtml(row.hero.join(" "))}</td>
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px;">${escapeHtml(row.board.join(" "))}</td>
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:800;">${escapeHtml(hitText)}</td>
+        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; opacity:.65;">${escapeHtml(idText)}</td>
+      </tr>
+    `;
+  }).join("");
+  const historyTable = (sameHeroHands.length || olderSameHeroHands.length) ? `
+    <div style="margin-top:10px; font-weight:800;">Tidligere samme hero-kort</div>
+    <div style="margin-top:2px; opacity:.6; font-size:11px;">Denne tabellen viser hender med samme hero-ranker, sortert nyest først. "3. nyeste" betyr tredje nyeste hånd i dette utvalget, ikke tredje siste runde totalt.</div>
+    <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff; border:1px solid #e5e7eb; margin-top:5px;">
+      <thead>
+        <tr style="background:#f3f4f6;">
+          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Rekkefølge</th>
+          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Hero</th>
+          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Board</th>
+          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Match</th>
+          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Hand-id</th>
+        </tr>
+      </thead>
+      <tbody>${historyRows}${olderHistoryRows}</tbody>
+    </table>
+    <div style="margin-top:5px; opacity:.6; font-size:11px;">Viser ${Math.min(12, sameHeroHands.length)} av ${sameHeroHands.length} lagrede runder med samme hero-kort${olderSameHeroHands.length ? `, pluss ${Math.min(8, olderSameHeroHands.length)} eldre rader fra andre sessions som ikke telles i tallene over` : ""}.</div>
+  ` : `
+    <div style="margin-top:10px; opacity:.65;">Ingen tidligere runder funnet der du hadde denne hero-rank-kombinasjonen ennå.</div>
+  `;
+
+  const statCard = (label, value, sub, color) => `
+    <div style="border:1px solid #e5e7eb; background:#fff; padding:8px; border-radius:6px; min-width:120px; flex:1;">
+      <div style="font-size:11px; opacity:.65; margin-bottom:3px;">${escapeHtml(label)}</div>
+      <div style="font-size:18px; font-weight:800; color:${color};">${escapeHtml(value)}</div>
+      <div style="font-size:11px; opacity:.65; margin-top:3px;">${escapeHtml(sub)}</div>
+    </div>
+  `;
+
   box.innerHTML = `
     <div style="border:1px solid #e5e7eb; background:#fafafa; padding:8px; border-radius:6px;">
-      <div style="font-weight:700; margin-bottom:6px;">Hero-kort mot tidligere runder</div>
-      <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff;">
+      <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:8px;">
+        <div>
+          <div style="font-weight:800; margin-bottom:2px;">Hero-ranker mot board</div>
+          <div style="font-size:10px; opacity:.45; margin-bottom:2px;">visning: hero-board-read-timeout-20260620a</div>
+          <div style="font-size:11px; opacity:.65;">${escapeHtml(heroCards.join(" "))} sjekket mot ${sameHeroWithBoardCount} lagrede runder totalt${activeSessionId && usingAllSessionsForStats ? ` (aktiv session ${escapeHtml(activeSessionId)}, men historikken teller alle sessions)` : ""} med samme hero-ranker og lagret board. Hero-kort-radene teller rank-treff innenfor samme hero-ranker, uansett suit${backendCardHistory.length ? ` (${backendCardHistory.length} fra database, ${allBoardCount} totale med boardkort etter filter)` : ""}.</div>
+          <div style="font-size:11px; opacity:.55; margin-top:2px;">Samme hero-ranker finnes i ${sameHeroWithBoardCount} lagrede runder.</div>
+          <div style="font-size:11px; opacity:.55; margin-top:2px;">Historikkilde: ${backendCardHistory.length ? "database" : backendCardHistoryInFlight ? "laster database..." : "lokal nettleserhistorikk"}</div>
+        </div>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; border:1px solid #e5e7eb; background:#fff; padding:8px; border-radius:6px; margin-bottom:8px;">
+        <div style="font-size:11px; opacity:.65;">Nåværende board</div>
+        <div style="font-weight:800;">${escapeHtml(currentBoardCards.join(" ") || "-")}</div>
+        <div style="font-weight:800; color:${currentHits.some(item => item.hit) ? "#15803d" : "#666"};">${escapeHtml(currentHitText)}</div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+        ${heroRanks.length === 1 ? "" : statCard("Minst ett treff", String(anyHitIndexes.length), anyHitSummary.latest, anyHitIndexes.length ? "#c2410c" : "#666")}
+        ${heroRanks.length === 1 ? "" : statCard("Begge treff board", String(comboIndexes.length), comboSummary.latest, comboIndexes.length ? "#15803d" : "#666")}
+        ${heroRanks.map(rank => {
+          const stats = rankStats[rank];
+          const nowHit = currentBoardRanks.has(rank) ? "matcher nå" : "matcher ikke nå";
+          return statCard(`${rank} hero->board`, String(stats.matches), `${nowHit} | ${stats.attempts} lagrede boards med ${rank}`, stats.matches ? "#1d4ed8" : "#666");
+        }).join("")}
+      </div>
+      <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff; border:1px solid #e5e7eb;">
         <thead>
-          <tr>
-            <th style="text-align:left; padding:5px 6px; border-bottom:1px solid #d1d5db;">Type</th>
-            <th style="text-align:left; padding:5px 6px; border-bottom:1px solid #d1d5db;">Kort</th>
-            <th style="text-align:right; padding:5px 6px; border-bottom:1px solid #d1d5db;">Antall</th>
-            <th style="text-align:left; padding:5px 6px; border-bottom:1px solid #d1d5db;">Runder siden</th>
+          <tr style="background:#f3f4f6;">
+            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Type</th>
+            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Kort</th>
+            <th style="text-align:center; padding:7px 8px; border-bottom:1px solid #d1d5db;">Matcher</th>
+            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Sist sett</th>
+            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Siste matcher</th>
           </tr>
         </thead>
         <tbody>${tableRows}</tbody>
       </table>
-      <div style="margin-top:6px; opacity:.6; font-size:11px;">Basert på ${list.length} lagrede runder, nyeste runde først.</div>
+      ${madeHandTable}
+      ${historyTable}
+      <div style="margin-top:6px; opacity:.6; font-size:11px;">Lagres automatisk når hero og board blir registrert/beregnet. Nyeste runde først.</div>
     </div>
   `;
 }
 
-function addCardHistoryEntry(heroCards, boardCards) {
+function addCardHistoryEntry(heroCards, boardCards, source = "local") {
     if (!heroCards || heroCards.length !== 2) return;
 
     const newEntry = {
         hero: heroCards.map(convertBetSolidCard),
         board: (boardCards || []).map(convertBetSolidCard),
-        at: Date.now()
+        at: Date.now(),
+        source
     };
 
     const list = dedupeCardHistory(loadCardHistory());
     const newKey = cardHistoryKey(newEntry);
+    const heroOnlyKey = `${newEntry.hero.join("|")}::`;
 
 const first = list[0];
 
@@ -655,7 +1447,9 @@ const sameAsLast =
 if (sameAsLast) {
     console.log("â­ï¸ Same hole cards skipped");
     first.at = Date.now();
+    first.source = first.source || source;
     saveCardHistory(list);
+    if (first.board && first.board.length) saveHeroBoardMatchHistory(first.hero, first.board, first.source || source);
     renderCardHistory();
     renderHeroHistoryMatches();
     return;
@@ -664,8 +1458,21 @@ if (sameAsLast) {
     const existingIdx = list.findIndex(e => cardHistoryKey(e) === newKey);
     if (existingIdx >= 0) {
         const [existing] = list.splice(existingIdx, 1);
+        existing.board = newEntry.board;
         existing.at = Date.now();
+        existing.source = existing.source || source;
         list.unshift(existing);
+    } else if (newEntry.board.length) {
+        const heroOnlyIdx = list.findIndex(e => cardHistoryKey(e) === heroOnlyKey);
+        if (heroOnlyIdx >= 0) {
+            const [existing] = list.splice(heroOnlyIdx, 1);
+            existing.board = newEntry.board;
+            existing.at = Date.now();
+            existing.source = existing.source || source;
+            list.unshift(existing);
+        } else {
+            list.unshift(newEntry);
+        }
     } else {
         list.unshift(newEntry);
     }
@@ -673,20 +1480,70 @@ if (sameAsLast) {
     if (list.length > 200) list.length = 200;
 
     saveCardHistory(list);
+    if (newEntry.board.length) saveHeroBoardMatchHistory(newEntry.hero, newEntry.board, source);
     renderCardHistory();
     renderHeroHistoryMatches();
     scheduleStartingHandsRefresh("card-history", newKey);
 }
 
+function saveHeroBoardMatchHistory(heroCards, boardCards, source = "manual", meta = {}) {
+  const hero = (heroCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+  const board = (boardCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+  if (hero.length !== 2 || !board.length) return false;
+  if (new Set(hero.concat(board)).size !== hero.length + board.length) return false;
+  try {
+    const boardRanks = new Set(board.map(card => card[0]));
+    const heroRanks = [...new Set(hero.map(card => card[0]))];
+    const hits = heroRanks.filter(rank => boardRanks.has(rank));
+    if (!hits.length) {
+      console.log(`Hero-board match not saved from ${source}: no hero rank on board`, hero.join(" "), board.join(" "));
+      return false;
+    }
+    const entry = normalizeHeroBoardMatchEntry({
+      hero,
+      board,
+      at: Date.now(),
+      source,
+      hand_id: meta?.hand_id || "",
+      site_hand_id: meta?.site_hand_id || "",
+      session_id: meta?.session_id || "",
+      hits,
+      misses: heroRanks.filter(rank => !boardRanks.has(rank))
+    });
+    const list = dedupeHeroBoardMatchHistory(loadHeroBoardMatchHistory());
+    const key = heroBoardMatchHistoryKey(entry);
+    const existingIdx = list.findIndex(item => heroBoardMatchHistoryKey(item) === key);
+    if (existingIdx >= 0) list.splice(existingIdx, 1);
+    list.unshift(entry);
+    if (list.length > 500) list.length = 500;
+    saveHeroBoardMatchHistoryList(list);
+    console.log(`Saved hero-board rank match history from ${source}:`, hero.join(" "), board.join(" "), "hits:", entry.hits.join(" ") || "-");
+    return true;
+  } catch (e) {
+    console.warn("Could not save hero/board match history", e);
+    return false;
+  }
+}
+
 function renderCardHistory() {
   const box = $("cardHistoryBox");
   if (!box) return;
-  const list = dedupeCardHistory(loadCardHistory());
-  saveCardHistory(list);
+  if (!backendCardHistory.length && !backendCardHistoryInFlight) {
+    refreshBackendCardHistory({ force: true, limit: 80, timeoutMs: 4000 }).catch(console.warn);
+  }
+  if (backendCardHistoryInFlight && !backendCardHistory.length) {
+    box.innerHTML = `<div style="opacity:.7; font-style:italic;">Laster kort historikk fra backend...</div>`;
+    return;
+  }
+  const usingBackendHistory = backendCardHistory.length > 0;
+  const list = usingBackendHistory
+    ? backendCardHistory
+    : dedupeCardHistory(loadCardHistory()).filter(e => !["screen-live", "hand-viewer"].includes(String(e?.source || "")));
+  if (!usingBackendHistory) saveCardHistory(list);
   if (!list.length) {
     box.innerHTML = `
-      <div style="opacity:.7; font-style:italic;">Ingen kort historikk ennÃ¥.</div>
-      <div style="margin-top:6px; font-size:12px; opacity:.6;">Historikken oppdateres fra importerte/lagrede hender, ikke live equity.</div>
+      <div style="opacity:.7; font-style:italic;">Ingen kort historikk enna.</div>
+      <div style="margin-top:6px; font-size:12px; opacity:.6;">${backendCardHistoryError ? `Backend-historikk: ${escapeHtml(backendCardHistoryError)}.` : "Historikken oppdateres fra importerte/lagrede hender, ikke live equity."}</div>
     `;
     renderHeroHistoryMatches();
     return;
@@ -716,13 +1573,17 @@ function renderCardHistory() {
     else offsuit++;
   }
 
-  // build HTML with live updates
+  const liveStatusText = lastLiveHeroText
+    ? `Livekort: ${lastLiveHeroText}${lastLiveBoardText ? ` / board ${lastLiveBoardText}` : ""}`
+    : lastLiveCardsStatus;
+
+  // build HTML with saved history updates
   const recent = list.slice(0, 12).map((e, idx) => {
     const d = new Date(e.at);
     const time = d.toLocaleTimeString();
     const boardTxt = (e.board && e.board.length) ? ` | board: <span style="color:#666;">${e.board.join(" ")}</span>` : "";
-    const isNew = idx === 0 ? ' style="background:#e8f5e9; padding:4px; margin:0 -4px; border-radius:3px;"' : '';
-    return `<div${isNew} style="margin-bottom:4px;"><b style="color:#1976D2;">${e.hero.join(" ")}</b>${boardTxt} <span style="opacity:.5; font-size:11px; margin-left:8px;">â° ${time}</span></div>`;
+    const rowStyle = idx === 0 && !usingBackendHistory ? ' style="background:#e8f5e9; padding:4px; margin:0 -4px; border-radius:3px;"' : '';
+    return `<div${rowStyle} style="margin-bottom:4px;"><b style="color:#1976D2;">${e.hero.join(" ")}</b>${boardTxt} <span style="opacity:.5; font-size:11px; margin-left:8px;">â° ${time}</span></div>`;
   }).join("");
 
   const cardLines = Object.keys(cardCount).sort((a,b)=>cardCount[b]-cardCount[a]).map(c=>`<span style="color:#D32F2F;"><b>${c}</b>:${cardCount[c]}</span>`).join("  ");
@@ -731,9 +1592,10 @@ function renderCardHistory() {
 
   box.innerHTML = `
     <div style="margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
-      <div style="font-weight:600;">ðŸ“Š Nylig (${list.length} totalt)</div>
-      <div style="font-size:11px; opacity:.6;">ðŸ”„ oppdateres automatisk</div>
+      <div style="font-weight:600;">ðŸ“Š ${usingBackendHistory ? "Databasehistorikk" : "Lokal historikk"} (${list.length} totalt)</div>
+      <div style="font-size:11px; opacity:.6;">${usingBackendHistory ? "database" : "lokal historikk"} â€¢ oppdateres automatisk</div>
     </div>
+    <div style="margin-bottom:8px; font-size:12px; font-weight:700; color:${lastLiveHeroText ? "#15803d" : "#b45309"};">${renderLiveStatusWithCapture(liveStatusText)}</div>
     <div style="margin-bottom:10px; background:#fafafa; padding:8px; border-radius:4px; max-height:120px; overflow-y:auto; border-left:3px solid #1976D2;">${recent}</div>
     <div style="margin-top:8px; font-size:12px; opacity:.9;"><strong>Kort:</strong> ${cardLines}</div>
     <div style="margin-top:4px; font-size:12px; opacity:.85;"><strong>Rank:</strong> ${rankLines}</div>
@@ -746,8 +1608,20 @@ function renderCardHistory() {
   if (btn) btn.addEventListener("click", () => {
     if (!confirm("Slett all kort-historikk?")) return;
     saveCardHistory([]);
+    saveHeroBoardMatchHistoryList([]);
     renderCardHistory();
     renderHeroHistoryMatches();
+  });
+  const copyCaptureBtn = $("copyLiveCapture");
+  if (copyCaptureBtn) copyCaptureBtn.addEventListener("click", async () => {
+    const capture = copyCaptureBtn.dataset.capture || "";
+    if (!capture) return;
+    try {
+      await navigator.clipboard.writeText(capture);
+      copyCaptureBtn.innerText = "Kopiert";
+    } catch (e) {
+      window.prompt("Kopier capture-filnavn:", capture);
+    }
   });
   renderHeroHistoryMatches();
 }
@@ -781,7 +1655,8 @@ function handleCardInput() {
 async function runEquityCalculation(opts = { auto: false }) {
   console.log(`ðŸŽ² runEquityCalculation called, opts:`, opts);
   const heroText = normalizeSpaces(opts.heroText ?? $("hero")?.value);
-  const boardText = normalizeSpaces(opts.boardText ?? $("board")?.value);
+  const fallbackBoardText = cardsToText(liveBoardFallbackCards());
+  const boardText = normalizeSpaces((opts.boardText ?? $("board")?.value) || fallbackBoardText);
   const villains = Number($("numVillains")?.value || 1);
   const rangesText = normalizeSpaces($("villains")?.value || "");
   console.log(`  heroText="${heroText}", boardText="${boardText}", villains=${villains}`);
@@ -937,7 +1812,7 @@ async function runEquityCalculation(opts = { auto: false }) {
     
     const shouldSaveHistory = opts.saveHistory === true;
     if (shouldSaveHistory) {
-      try { addCardHistoryEntry(heroCards, boardCards); } catch(e) { console.warn(e); }
+      try { addCardHistoryEntry(heroCards, boardCards, "equity-calculation"); } catch(e) { console.warn(e); }
     }
   } catch (e) {
     console.error("âŒ Equity fetch failed:", e);
@@ -1061,6 +1936,10 @@ let hvPickerTarget = "hero";
 let hvHeroCards = [];
 let hvBoardCards = [];
 let hvEquityManualMode = false;
+let heroCorrectionCards = [];
+let heroCorrectionSelected = 0;
+let boardCorrectionCards = [];
+let boardCorrectionSelected = 0;
 
 function cardsToText(cards) {
   return (cards || []).join(" ");
@@ -1142,6 +2021,7 @@ function clearManualCards() {
   manualPickerHeroCards = [];
   manualPickerBoardCards = [];
   manualLiveMode = false;
+  lastManualBoardText = "";
   const heroEl = $("hero");
   const boardEl = $("board");
   if (heroEl) heroEl.value = "";
@@ -1154,6 +2034,691 @@ function clearManualCards() {
   const autoStatus = $("autoEquityStatus");
   if (autoStatus) autoStatus.innerText = "Auto-leser aktiv.";
   manualPickerStatus("Klar for ny hand.");
+}
+
+function setHeroRegisterStatus(text) {
+  const el = $("heroRegisterStatus");
+  if (el) el.innerText = text || "";
+}
+
+function showHeroClipboardPreview(dataUrl) {
+  const wrap = $("heroClipboardPreview");
+  const img = $("heroClipboardImage");
+  if (!wrap || !img || !dataUrl) return;
+  img.src = dataUrl;
+  wrap.style.display = "block";
+}
+
+async function readCardsFromImageDataUrl(dataUrl) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("Kortlesing tok for lang tid."), 30000);
+  let res;
+  try {
+    res = await fetch(`${apiBase()}/read-board-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image_data: dataUrl }),
+      signal: controller.signal
+    });
+  } catch (e) {
+    if (e?.name === "AbortError" || controller.signal.aborted) {
+      throw new Error("Kortlesing tok over 30 sekunder. Prov igjen, eller klipp tettere rundt kortene.");
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (_) {
+    data = {};
+  }
+
+  if (!res.ok) {
+    const detail = data?.detail || data?.error || `HTTP ${res.status}`;
+    throw new Error(detail);
+  }
+
+  return parseCards(data.board || "").filter(isCard).slice(0, 5);
+}
+
+function syncHeroCorrectionInput() {
+  const input = $("heroRegisterInput");
+  if (input) input.value = cardsToText(heroCorrectionCards);
+}
+
+function renderHeroCorrection() {
+  const box = $("heroCorrectionBox");
+  if (!box) return;
+  if (!heroCorrectionCards.length) {
+    box.style.display = "none";
+    box.innerHTML = "";
+    return;
+  }
+  box.style.display = "block";
+
+  const cardButtons = heroCorrectionCards.map((card, idx) => `
+    <button type="button" class="heroCorrectionCard" data-idx="${idx}" style="min-width:42px; height:30px; border:1px solid ${idx === heroCorrectionSelected ? "#111" : "#ccc"}; background:${idx === heroCorrectionSelected ? "#111" : "#fff"}; color:${idx === heroCorrectionSelected ? "#fff" : "#111"}; border-radius:4px; font-weight:700; cursor:pointer;">
+      ${escapeHtml(card)}
+    </button>
+  `).join("");
+  const rankButtons = MANUAL_CARD_RANKS.map(rank => `
+    <button type="button" class="heroCorrectionRank" data-rank="${rank}" style="width:28px; height:26px; border:1px solid #ccc; background:#fff; border-radius:4px; font-weight:700; cursor:pointer;">${rank}</button>
+  `).join("");
+  const suitButtons = MANUAL_CARD_SUITS.map(suit => `
+    <button type="button" class="heroCorrectionSuit" data-suit="${suit.value}" style="width:34px; height:28px; border:1px solid #ccc; background:#fff; color:${suit.color}; border-radius:4px; font-size:17px; cursor:pointer;">${suit.label}</button>
+  `).join("");
+
+  box.innerHTML = `
+    <div style="font-weight:700; margin-bottom:6px;">Rett hero-forslag</div>
+    <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px;">${cardButtons}</div>
+    <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:6px;">${rankButtons}</div>
+    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+      ${suitButtons}
+      <button type="button" id="heroCorrectionRemove" style="height:28px;">Fjern</button>
+      <button type="button" id="heroCorrectionAdd" style="height:28px;">Legg til</button>
+      <button type="button" id="heroCorrectionApply" style="height:28px; font-weight:700;">Bruk forslag</button>
+    </div>
+  `;
+
+  box.querySelectorAll(".heroCorrectionCard").forEach(btn => {
+    btn.addEventListener("click", () => {
+      heroCorrectionSelected = Number(btn.dataset.idx || 0);
+      renderHeroCorrection();
+    });
+  });
+  box.querySelectorAll(".heroCorrectionRank").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = Math.max(0, Math.min(heroCorrectionSelected, heroCorrectionCards.length - 1));
+      const old = heroCorrectionCards[idx] || "As";
+      heroCorrectionCards[idx] = `${btn.dataset.rank || "A"}${old[1] || "s"}`;
+      syncHeroCorrectionInput();
+      renderHeroCorrection();
+    });
+  });
+  box.querySelectorAll(".heroCorrectionSuit").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = Math.max(0, Math.min(heroCorrectionSelected, heroCorrectionCards.length - 1));
+      const old = heroCorrectionCards[idx] || "As";
+      heroCorrectionCards[idx] = `${old[0] || "A"}${btn.dataset.suit || "s"}`;
+      syncHeroCorrectionInput();
+      renderHeroCorrection();
+    });
+  });
+  $("heroCorrectionRemove")?.addEventListener("click", () => {
+    if (!heroCorrectionCards.length) return;
+    heroCorrectionCards.splice(heroCorrectionSelected, 1);
+    heroCorrectionSelected = Math.max(0, Math.min(heroCorrectionSelected, heroCorrectionCards.length - 1));
+    syncHeroCorrectionInput();
+    renderHeroCorrection();
+  });
+  $("heroCorrectionAdd")?.addEventListener("click", () => {
+    if (heroCorrectionCards.length >= 2) {
+      setHeroRegisterStatus("Hero kan maks ha 2 kort.");
+      return;
+    }
+    heroCorrectionCards.push("As");
+    heroCorrectionSelected = heroCorrectionCards.length - 1;
+    syncHeroCorrectionInput();
+    renderHeroCorrection();
+  });
+  $("heroCorrectionApply")?.addEventListener("click", () => {
+    registerHeroCards(heroCorrectionCards, "Hero registrert fra rettet forslag.");
+  });
+}
+
+function setHeroCorrectionCards(cards) {
+  heroCorrectionCards = (cards || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+  heroCorrectionSelected = 0;
+  syncHeroCorrectionInput();
+  renderHeroCorrection();
+}
+
+function registerHeroCards(heroCards, source = "Hero registrert.") {
+  const normalizedHero = (heroCards || []).map(convertBetSolidCard).filter(Boolean).slice(0, 2);
+  const boardCards = [];
+
+  if (normalizedHero.length !== 2) {
+    setHeroRegisterStatus("Hero må ha 2 kort.");
+    return false;
+  }
+  if (!normalizedHero.every(isCard)) {
+    setHeroRegisterStatus("Ugyldig hero-format. Bruk f.eks. Ah Kh.");
+    return false;
+  }
+  if (new Set(normalizedHero.concat(boardCards)).size !== normalizedHero.length + boardCards.length) {
+    setHeroRegisterStatus("Samme kort finnes i hero/board.");
+    return false;
+  }
+
+  manualLiveMode = true;
+  manualPickerHeroCards = normalizedHero.slice();
+  if (boardCards.length) manualPickerBoardCards = boardCards.slice();
+  manualPickerTarget = manualPickerHeroCards.length < 2 ? "hero" : "board";
+
+  const heroEl = $("hero");
+  if (heroEl) heroEl.value = cardsToText(normalizedHero);
+  const input = $("heroRegisterInput");
+  if (input) input.value = cardsToText(normalizedHero);
+  heroCorrectionCards = [];
+  renderHeroCorrection();
+
+  renderManualCardPicker();
+  addCardHistoryEntry(normalizedHero, [], "hero-register");
+  renderHeroHistoryMatches();
+  scheduleAutoEquity({ manual: true });
+  setHeroRegisterStatus(source);
+  saveLiveCardsToCurrentHand(normalizedHero, [], { source: "manual-hero-register" })
+    .then(saved => {
+      if (saved) setHeroRegisterStatus(`${source} Lagret på hand.`);
+    })
+    .catch(e => console.warn("Could not save registered hero", e));
+  return true;
+}
+
+async function readHeroFromClipboard() {
+  try {
+    setHeroRegisterStatus("Leser utklipp...");
+
+    if (navigator.clipboard?.readText) {
+      try {
+        const text = await navigator.clipboard.readText();
+        const cards = parseBoardCardsFromClipboardText(text).slice(0, 2);
+        if (cards.length) {
+          if (cards.length === 2) registerHeroCards(cards, "Hero lest fra clipboard-tekst.");
+          else {
+            const input = $("heroRegisterInput");
+            if (input) input.value = cardsToText(cards);
+            setHeroCorrectionCards(cards);
+            setHeroRegisterStatus("Fant bare 1 kort i teksten. Rett og legg til ett kort.");
+          }
+          return;
+        }
+      } catch (_) {
+        // Clipboard text can be blocked while image read still works.
+      }
+    }
+
+    if (!navigator.clipboard?.read) {
+      setHeroRegisterStatus("Nettleseren støtter ikke bildelesing fra clipboard her.");
+      return;
+    }
+
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      const imageType = item.types.find(type => type.startsWith("image/"));
+      if (!imageType) continue;
+
+      const blob = await item.getType(imageType);
+      await readHeroImageBlob(blob, "Hero lest fra clipboard-bilde.");
+      return;
+    }
+
+    setHeroRegisterStatus("Ingen tekst eller bilde funnet i clipboard.");
+  } catch (e) {
+    console.warn("Clipboard hero read failed", e);
+    $("heroPasteZone")?.focus();
+    setHeroRegisterStatus("Nettleseren blokkerte direkte lesing. Klikk paste-sonen og trykk Ctrl+V.");
+  }
+}
+
+async function readHeroImageBlob(blob, sourceLabel = "Hero lest fra bilde.") {
+  heroCorrectionCards = [];
+  renderHeroCorrection();
+  const input = $("heroRegisterInput");
+  if (input) input.value = "";
+
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+  showHeroClipboardPreview(dataUrl);
+
+  let cards = [];
+  try {
+    cards = await readCardsFromImageDataUrl(dataUrl);
+  } catch (e) {
+    setHeroRegisterStatus(e?.message || "Bildet ble limt inn, men automatisk bildelesing er ikke aktiv.");
+    return false;
+  }
+  if (!cards.length) {
+    setHeroRegisterStatus("Fant ingen hero-kort i bildet.");
+    return false;
+  }
+
+  cards = cards.length > 2 ? [cards[0], cards[cards.length - 1]] : cards.slice(0, 2);
+  if (input) input.value = cardsToText(cards);
+  setHeroCorrectionCards(cards);
+  setHeroRegisterStatus(`Forslag fra bilde: ${cardsToText(cards)}. Rett ved behov og trykk Registrer hero.`);
+  return true;
+}
+
+async function handleHeroPaste(ev) {
+  try {
+    const data = ev.clipboardData;
+    if (!data) return;
+    ev.preventDefault();
+    setHeroRegisterStatus("Leser innlimt utklipp...");
+
+    const text = data.getData("text/plain") || "";
+    const textCards = parseBoardCardsFromClipboardText(text).slice(0, 2);
+    if (textCards.length) {
+      if (textCards.length === 2) registerHeroCards(textCards, "Hero lest fra innlimt tekst.");
+      else {
+        const input = $("heroRegisterInput");
+        if (input) input.value = cardsToText(textCards);
+        setHeroCorrectionCards(textCards);
+        setHeroRegisterStatus("Fant bare 1 kort i teksten. Rett og legg til ett kort.");
+      }
+      return;
+    }
+
+    const imageItem = Array.from(data.items || []).find(item => item.type && item.type.startsWith("image/"));
+    if (!imageItem) {
+      setHeroRegisterStatus("Fant ingen korttekst eller bilde i innlimingen.");
+      return;
+    }
+
+    const blob = imageItem.getAsFile();
+    if (!blob) {
+      setHeroRegisterStatus("Klarte ikke hente bilde fra innliming.");
+      return;
+    }
+    await readHeroImageBlob(blob, "Hero lest fra innlimt bilde.");
+  } catch (e) {
+    console.warn("Hero paste failed", e);
+    setHeroRegisterStatus("Klarte ikke lese innlimt utklipp.");
+  }
+}
+
+function sendHeroToProfileEquity() {
+  const heroCards = parseCards($("heroRegisterInput")?.value || $("hero")?.value || "").filter(isCard).slice(0, 2);
+  if (heroCards.length !== 2) {
+    setHeroRegisterStatus("Trenger 2 hero-kort før sending.");
+    return false;
+  }
+  if (!$("ppHeroCards")) {
+    setHeroRegisterStatus("Åpne/last Live equity mot først.");
+    return false;
+  }
+
+  if ($("ppEquityAuto")) $("ppEquityAuto").checked = false;
+  $("ppHeroCards").value = cardsToText(heroCards);
+  if ($("ppBoardCards") && $("board")?.value) $("ppBoardCards").value = normalizeSpaces($("board").value);
+  syncProfileEquityPickerFromInputs({ manual: true });
+  lastPlayerProfileEquityKey = "";
+  setHeroRegisterStatus("Hero sendt til Live equity mot.");
+  setProfileEquityStatus("Hero-kort kopiert fra Equity Calculator.");
+  calculateProfileEquity().catch(console.warn);
+  $("ppHeroCards")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  return true;
+}
+
+function setBoardRegisterStatus(text) {
+  const el = $("boardRegisterStatus");
+  if (el) el.innerText = text || "";
+}
+
+function showBoardClipboardPreview(dataUrl) {
+  const wrap = $("boardClipboardPreview");
+  const img = $("boardClipboardImage");
+  if (!wrap || !img || !dataUrl) return;
+  img.src = dataUrl;
+  wrap.style.display = "block";
+}
+
+function syncBoardCorrectionInput() {
+  const input = $("boardRegisterInput");
+  if (input) input.value = cardsToText(boardCorrectionCards);
+}
+
+function renderBoardCorrection() {
+  const box = $("boardCorrectionBox");
+  if (!box) return;
+  if (!boardCorrectionCards.length) {
+    box.style.display = "none";
+    box.innerHTML = "";
+    return;
+  }
+  box.style.display = "block";
+
+  const cardButtons = boardCorrectionCards.map((card, idx) => `
+    <button type="button" class="boardCorrectionCard" data-idx="${idx}" style="min-width:42px; height:30px; border:1px solid ${idx === boardCorrectionSelected ? "#111" : "#ccc"}; background:${idx === boardCorrectionSelected ? "#111" : "#fff"}; color:${idx === boardCorrectionSelected ? "#fff" : "#111"}; border-radius:4px; font-weight:700; cursor:pointer;">
+      ${escapeHtml(card)}
+    </button>
+  `).join("");
+  const rankButtons = MANUAL_CARD_RANKS.map(rank => `
+    <button type="button" class="boardCorrectionRank" data-rank="${rank}" style="width:28px; height:26px; border:1px solid #ccc; background:#fff; border-radius:4px; font-weight:700; cursor:pointer;">${rank}</button>
+  `).join("");
+  const suitButtons = MANUAL_CARD_SUITS.map(suit => `
+    <button type="button" class="boardCorrectionSuit" data-suit="${suit.value}" style="width:34px; height:28px; border:1px solid #ccc; background:#fff; color:${suit.color}; border-radius:4px; font-size:17px; cursor:pointer;">${suit.label}</button>
+  `).join("");
+
+  box.innerHTML = `
+    <div style="font-weight:700; margin-bottom:6px;">Rett forslag</div>
+    <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px;">${cardButtons}</div>
+    <div style="display:flex; gap:5px; flex-wrap:wrap; margin-bottom:6px;">${rankButtons}</div>
+    <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+      ${suitButtons}
+      <button type="button" id="boardCorrectionRemove" style="height:28px;">Fjern</button>
+      <button type="button" id="boardCorrectionAdd" style="height:28px;">Legg til</button>
+      <button type="button" id="boardCorrectionApply" style="height:28px; font-weight:700;">Bruk forslag</button>
+    </div>
+  `;
+
+  box.querySelectorAll(".boardCorrectionCard").forEach(btn => {
+    btn.addEventListener("click", () => {
+      boardCorrectionSelected = Number(btn.dataset.idx || 0);
+      renderBoardCorrection();
+    });
+  });
+  box.querySelectorAll(".boardCorrectionRank").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = Math.max(0, Math.min(boardCorrectionSelected, boardCorrectionCards.length - 1));
+      const old = boardCorrectionCards[idx] || "As";
+      boardCorrectionCards[idx] = `${btn.dataset.rank || "A"}${old[1] || "s"}`;
+      syncBoardCorrectionInput();
+      renderBoardCorrection();
+    });
+  });
+  box.querySelectorAll(".boardCorrectionSuit").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = Math.max(0, Math.min(boardCorrectionSelected, boardCorrectionCards.length - 1));
+      const old = boardCorrectionCards[idx] || "As";
+      boardCorrectionCards[idx] = `${old[0] || "A"}${btn.dataset.suit || "s"}`;
+      syncBoardCorrectionInput();
+      renderBoardCorrection();
+    });
+  });
+  $("boardCorrectionRemove")?.addEventListener("click", () => {
+    if (!boardCorrectionCards.length) return;
+    boardCorrectionCards.splice(boardCorrectionSelected, 1);
+    boardCorrectionSelected = Math.max(0, Math.min(boardCorrectionSelected, boardCorrectionCards.length - 1));
+    syncBoardCorrectionInput();
+    renderBoardCorrection();
+  });
+  $("boardCorrectionAdd")?.addEventListener("click", () => {
+    if (boardCorrectionCards.length >= 5) {
+      setBoardRegisterStatus("Board kan maks ha 5 kort.");
+      return;
+    }
+    boardCorrectionCards.push("As");
+    boardCorrectionSelected = boardCorrectionCards.length - 1;
+    syncBoardCorrectionInput();
+    renderBoardCorrection();
+  });
+  $("boardCorrectionApply")?.addEventListener("click", () => {
+    registerBoardCards(boardCorrectionCards, "Board registrert fra rettet forslag.");
+  });
+}
+
+function setBoardCorrectionCards(cards) {
+  boardCorrectionCards = (cards || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+  boardCorrectionSelected = 0;
+  syncBoardCorrectionInput();
+  renderBoardCorrection();
+}
+
+function parseBoardCardsFromClipboardText(text) {
+  let t = String(text || "")
+    .replace(/♠|♤/g, "s")
+    .replace(/♥|♡/g, "h")
+    .replace(/♦|♢/g, "d")
+    .replace(/♣|♧/g, "c")
+    .replace(/\b(spades?|spar|spa?r)\b/gi, "s")
+    .replace(/\b(hearts?|hjerter?)\b/gi, "h")
+    .replace(/\b(diamonds?|ruter?)\b/gi, "d")
+    .replace(/\b(clubs?|klo?ver?)\b/gi, "c")
+    .replace(/10/g, "T")
+    .toUpperCase();
+
+  const cards = [];
+  const compact = t.match(/[2-9TJQKA]\s*[SHDC]/g) || [];
+  compact.forEach(raw => {
+    const card = raw.replace(/\s+/g, "");
+    cards.push(card[0] + card[1].toLowerCase());
+  });
+
+  return cards.filter(isCard).slice(0, 5);
+}
+
+function registerBoardCards(boardCards, source = "Board registrert.") {
+  const normalizedBoard = (boardCards || []).map(convertBetSolidCard).filter(Boolean);
+  const heroCards = parseCards($("hero")?.value || $("heroRegisterInput")?.value || $("ppHeroCards")?.value || lastLiveHeroText || "").filter(isCard).slice(0, 2);
+
+  if (normalizedBoard.length > 5) {
+    setBoardRegisterStatus("Board kan maks ha 5 kort.");
+    return false;
+  }
+  if (!normalizedBoard.every(isCard)) {
+    setBoardRegisterStatus("Ugyldig board-format. Bruk f.eks. Qs Jd 2c.");
+    return false;
+  }
+  if (new Set(heroCards.concat(normalizedBoard)).size !== heroCards.length + normalizedBoard.length) {
+    setBoardRegisterStatus("Samme kort finnes i hero/board.");
+    return false;
+  }
+
+  manualLiveMode = true;
+  manualPickerBoardCards = normalizedBoard.slice();
+  if (heroCards.length === 2) manualPickerHeroCards = heroCards.slice();
+  manualPickerTarget = manualPickerHeroCards.length < 2 ? "hero" : "board";
+
+  const boardEl = $("board");
+  if (boardEl) boardEl.value = cardsToText(normalizedBoard);
+  const input = $("boardRegisterInput");
+  if (input) input.value = cardsToText(normalizedBoard);
+  lastManualBoardText = cardsToText(normalizedBoard);
+  boardCorrectionCards = [];
+  renderBoardCorrection();
+
+  renderManualCardPicker();
+  const historySaved = saveHeroBoardMatchHistory(heroCards, normalizedBoard, "board-register");
+  renderHeroHistoryMatches();
+  scheduleAutoEquity({ manual: true });
+  setBoardRegisterStatus(historySaved ? `${source} Match lagret.` : source);
+  if (heroCards.length === 2) {
+    saveLiveCardsToCurrentHand(heroCards, normalizedBoard, { source: "manual-board-register" })
+      .then(saved => {
+        if (saved) setBoardRegisterStatus(`${source} Lagret på hand.`);
+      })
+      .catch(e => console.warn("Could not save registered board", e));
+  }
+  return true;
+}
+
+async function readBoardFromClipboard() {
+  try {
+    setBoardRegisterStatus("Leser utklipp...");
+
+    if (navigator.clipboard?.readText) {
+      try {
+        const text = await navigator.clipboard.readText();
+        const cards = parseBoardCardsFromClipboardText(text);
+        if (cards.length) {
+          registerBoardCards(cards, "Board lest fra clipboard-tekst.");
+          return;
+        }
+      } catch (_) {
+        // Clipboard text can be blocked while image read still works.
+      }
+    }
+
+    if (!navigator.clipboard?.read) {
+      setBoardRegisterStatus("Nettleseren støtter ikke bildelesing fra clipboard her.");
+      return;
+    }
+
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      const imageType = item.types.find(type => type.startsWith("image/"));
+      if (!imageType) continue;
+
+      const blob = await item.getType(imageType);
+      await readBoardImageBlob(blob, "Board lest fra clipboard-bilde.");
+      return;
+    }
+
+    setBoardRegisterStatus("Ingen tekst eller bilde funnet i clipboard.");
+  } catch (e) {
+    console.warn("Clipboard board read failed", e);
+    $("boardPasteZone")?.focus();
+    setBoardRegisterStatus("Nettleseren blokkerte direkte lesing. Klikk paste-sonen og trykk Ctrl+V.");
+  }
+}
+
+async function readBoardImageBlob(blob, sourceLabel = "Board lest fra bilde.") {
+  boardCorrectionCards = [];
+  renderBoardCorrection();
+  const input = $("boardRegisterInput");
+  if (input) input.value = "";
+
+  const dataUrl = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+  showBoardClipboardPreview(dataUrl);
+
+  let cards = [];
+  try {
+    cards = await readCardsFromImageDataUrl(dataUrl);
+  } catch (e) {
+    setBoardRegisterStatus(e?.message || "Bildet ble limt inn, men automatisk bildelesing er ikke aktiv.");
+    return false;
+  }
+  if (!cards.length) {
+    setBoardRegisterStatus("Fant ingen boardkort i bildet.");
+    return false;
+  }
+  if (input) input.value = cardsToText(cards);
+  setBoardCorrectionCards(cards);
+  setBoardRegisterStatus(`Forslag fra bilde: ${cardsToText(cards)}. Rett ved behov og trykk Registrer board.`);
+  return true;
+}
+
+async function handleBoardPaste(ev) {
+  try {
+    const data = ev.clipboardData;
+    if (!data) return;
+    ev.preventDefault();
+    setBoardRegisterStatus("Leser innlimt utklipp...");
+
+    const text = data.getData("text/plain") || "";
+    const textCards = parseBoardCardsFromClipboardText(text);
+    if (textCards.length) {
+      registerBoardCards(textCards, "Board lest fra innlimt tekst.");
+      return;
+    }
+
+    const imageItem = Array.from(data.items || []).find(item => item.type && item.type.startsWith("image/"));
+    if (!imageItem) {
+      setBoardRegisterStatus("Fant ingen korttekst eller bilde i innlimingen.");
+      return;
+    }
+
+    const blob = imageItem.getAsFile();
+    if (!blob) {
+      setBoardRegisterStatus("Klarte ikke hente bilde fra innliming.");
+      return;
+    }
+    await readBoardImageBlob(blob, "Board lest fra innlimt bilde.");
+  } catch (e) {
+    console.warn("Board paste failed", e);
+    setBoardRegisterStatus("Klarte ikke lese innlimt utklipp.");
+  }
+}
+
+async function useLiveBoardForMainEquity() {
+  try {
+    setBoardRegisterStatus("Henter live board...");
+    const res = await fetch(`${apiBase()}/live-cards?ts=${Date.now()}`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const boardCards = parseCards(data.board || "");
+    registerBoardCards(boardCards, "Live board registrert.");
+  } catch (e) {
+    console.warn("Could not fetch live board", e);
+    setBoardRegisterStatus("Klarte ikke hente live board.");
+  }
+}
+
+async function copyMainBoardToClipboard() {
+  const boardText = normalizeSpaces($("board")?.value || $("boardRegisterInput")?.value || "");
+  if (!boardText) {
+    setBoardRegisterStatus("Ingen board å kopiere.");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(boardText);
+    setBoardRegisterStatus(`Kopiert: ${boardText}`);
+  } catch (e) {
+    console.warn("Clipboard failed", e);
+    setBoardRegisterStatus(`Board: ${boardText}`);
+  }
+}
+
+function sendBoardToProfileEquity() {
+  const boardCards = parseCards($("boardRegisterInput")?.value || $("board")?.value || "").filter(isCard).slice(0, 5);
+  if (!boardCards.length) {
+    setBoardRegisterStatus("Trenger board-kort før sending.");
+    return false;
+  }
+  if (!$("ppBoardCards")) {
+    setBoardRegisterStatus("Åpne/last Live equity mot først.");
+    return false;
+  }
+
+  if ($("ppEquityAuto")) $("ppEquityAuto").checked = false;
+  $("ppBoardCards").value = cardsToText(boardCards);
+  if ($("ppHeroCards") && $("hero")?.value && !normalizeSpaces($("ppHeroCards").value)) {
+    $("ppHeroCards").value = normalizeSpaces($("hero").value);
+  }
+  syncProfileEquityPickerFromInputs({ manual: true });
+  lastPlayerProfileEquityKey = "";
+  setBoardRegisterStatus("Board sendt til Live equity mot.");
+  setProfileEquityStatus("Board-kort kopiert fra Equity Calculator.");
+  calculateProfileEquity().catch(console.warn);
+  $("ppBoardCards")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  return true;
+}
+
+function sendManualPickerToProfileEquity() {
+  const { hero, board } = selectedManualCards();
+  const status = $("manualCardPickerStatus");
+
+  if (hero.length !== 2 || !hero.every(isCard)) {
+    if (status) status.innerText = "Trenger 2 hero-kort før sending.";
+    return false;
+  }
+  if (board.length > 5 || !board.every(isCard)) {
+    if (status) status.innerText = "Ugyldige board-kort.";
+    return false;
+  }
+  if (new Set(hero.concat(board)).size !== hero.length + board.length) {
+    if (status) status.innerText = "Samme kort finnes i hero/board.";
+    return false;
+  }
+  if (!$("ppHeroCards") || !$("ppBoardCards")) {
+    if (status) status.innerText = "Åpne/last Live equity mot først.";
+    return false;
+  }
+
+  if ($("ppEquityAuto")) $("ppEquityAuto").checked = false;
+  $("ppHeroCards").value = cardsToText(hero);
+  $("ppBoardCards").value = cardsToText(board);
+  syncProfileEquityPickerFromInputs({ manual: true });
+  lastPlayerProfileEquityKey = "";
+  if (status) status.innerText = "Sendt til Live equity mot.";
+  setProfileEquityStatus("Kort kopiert fra øverste kortvelger.");
+  calculateProfileEquity().catch(console.warn);
+  $("ppHeroCards")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  return true;
 }
 
 function renderManualCardPicker() {
@@ -1185,6 +2750,7 @@ function renderManualCardPicker() {
           <button type="button" id="manualTargetBoard" title="Velg board-kort" style="width:28px; height:28px; border:1px solid ${manualPickerTarget === "board" ? "#2196F3" : "#ddd"}; background:${manualPickerTarget === "board" ? "#e3f2fd" : "#fff"}; border-radius:6px; cursor:pointer; font-weight:700;">B</button>
           <button type="button" id="manualUndoCard" title="Angre siste kort" style="width:28px; height:28px; border:1px solid #ddd; background:#fff; border-radius:6px; cursor:pointer; font-size:16px; line-height:1;">&larr;</button>
           <button type="button" id="manualClearCards" title="Tom alle kort" style="width:28px; height:28px; border:1px solid #ddd; background:#fff; border-radius:6px; cursor:pointer; font-size:16px; line-height:1;">C</button>
+          <button type="button" id="manualSendLiveMot" title="Send disse kortene til Live equity mot" style="height:28px; border:1px solid #ddd; background:#fff; border-radius:6px; cursor:pointer; font-size:12px; white-space:nowrap;">Send til live mot</button>
         </div>
       </div>
       <div style="display:grid; gap:6px; font-size:12px; margin-top:12px;">
@@ -1220,6 +2786,7 @@ function renderManualCardPicker() {
   });
   $("manualUndoCard")?.addEventListener("click", undoManualCard);
   $("manualClearCards")?.addEventListener("click", clearManualCards);
+  $("manualSendLiveMot")?.addEventListener("click", sendManualPickerToProfileEquity);
 }
 
 function renderCardPickerBox(box, state) {
@@ -1324,11 +2891,59 @@ function wireEquityCalculator() {
   if (!btn) return;
 
   btn.addEventListener("click", () => {
-    runEquityCalculation({ auto: false, manual: true, live: true, saveHistory: false });
+    runEquityCalculation({ auto: false, manual: true, live: true, saveHistory: true });
   });
 
   $("handProbBtn")?.addEventListener("click", () => {
     runHandProbabilities().catch(console.error);
+  });
+
+  $("heroRegisterBtn")?.addEventListener("click", () => {
+    registerHeroCards(parseCards($("heroRegisterInput")?.value || ""), "Hero registrert.");
+  });
+  $("heroClipboardBtn")?.addEventListener("click", () => {
+    readHeroFromClipboard().catch(console.warn);
+  });
+  $("heroPasteZone")?.addEventListener("paste", (ev) => {
+    handleHeroPaste(ev).catch(console.warn);
+  });
+  $("heroPasteZone")?.addEventListener("click", () => {
+    setHeroRegisterStatus("Trykk Ctrl+V her for tekst eller bilde fra Utklippsverktøy.");
+  });
+  $("heroSendLiveMotBtn")?.addEventListener("click", () => {
+    sendHeroToProfileEquity();
+  });
+  $("heroRegisterInput")?.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    registerHeroCards(parseCards($("heroRegisterInput")?.value || ""), "Hero registrert.");
+  });
+
+  $("boardRegisterBtn")?.addEventListener("click", () => {
+    registerBoardCards(parseCards($("boardRegisterInput")?.value || ""), "Board registrert.");
+  });
+  $("boardClipboardBtn")?.addEventListener("click", () => {
+    readBoardFromClipboard().catch(console.warn);
+  });
+  $("boardPasteZone")?.addEventListener("paste", (ev) => {
+    handleBoardPaste(ev).catch(console.warn);
+  });
+  $("boardPasteZone")?.addEventListener("click", () => {
+    setBoardRegisterStatus("Trykk Ctrl+V her for tekst eller bilde fra Utklippsverktøy.");
+  });
+  $("boardUseLiveBtn")?.addEventListener("click", () => {
+    useLiveBoardForMainEquity().catch(console.warn);
+  });
+  $("boardSendLiveMotBtn")?.addEventListener("click", () => {
+    sendBoardToProfileEquity();
+  });
+  $("boardCopyBtn")?.addEventListener("click", () => {
+    copyMainBoardToClipboard().catch(console.warn);
+  });
+  $("boardRegisterInput")?.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    registerBoardCards(parseCards($("boardRegisterInput")?.value || ""), "Board registrert.");
   });
 
   // Live auto updates when hero/board/numVillains/villains change
@@ -1878,13 +3493,13 @@ async function loadHand(handId, opts = { silent: false }) {
           if ($("hvEquityStatus")) $("hvEquityStatus").innerText = "Kort fra hand lastet.";
         }
 
-        if (opts.saveHistory !== false) {
+        if (opts.saveHistory === true) {
           try {
             const existing = loadCardHistory();
             const first = existing && existing.length ? existing[0] : null;
             const sameAsLast = first && Array.isArray(first.hero) && first.hero[0] === hole.card1 && first.hero[1] === hole.card2 && JSON.stringify(first.board || []) === JSON.stringify(cardData.board || []);
             if (!sameAsLast) {
-                addCardHistoryEntry([hole.card1, hole.card2], cardData.board || []);
+                addCardHistoryEntry([hole.card1, hole.card2], cardData.board || [], "hand-viewer");
 
                 const statusEl = $("hvSaveStatus");
                 if (statusEl) statusEl.innerText = "Saved";
@@ -1937,7 +3552,7 @@ async function loadHand(handId, opts = { silent: false }) {
             return;
           }
           try {
-            addCardHistoryEntry(heroCards, []);
+            addCardHistoryEntry(heroCards, [], "hand-viewer");
             if (status) status.innerText = "Saved";
             setTimeout(() => { if (status) status.innerText = ""; }, 1200);
           } catch (e) {
@@ -2094,6 +3709,24 @@ async function loadPlayerProfile() {
         <div id="ppEquityOut" style="margin-top:10px;">
           <div style="opacity:.7;">Henter live kort...</div>
         </div>
+        <div style="margin-top:10px; border:1px solid #ddd; background:#fafafa; padding:10px;">
+          <div style="font-weight:800; margin-bottom:7px;">Beslutning</div>
+          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:8px;">
+            <label>Pot:
+              <input id="ppPotChips" type="number" min="0" step="1" placeholder="chips" style="width:90px;">
+            </label>
+            <label>Call/bet:
+              <input id="ppCallChips" type="number" min="0" step="1" placeholder="chips" style="width:90px;">
+            </label>
+            <label>Stack:
+              <input id="ppStackChips" type="number" min="0" step="1" placeholder="chips" style="width:90px;">
+            </label>
+            <button id="ppDecisionRefresh" type="button">Oppdater</button>
+          </div>
+          <div id="ppDecisionOut" style="max-width:560px;">
+            <div style="opacity:.65;">Beregn equity først. Fyll pot/call/stack for pot-odds.</div>
+          </div>
+        </div>
       </div>
     `;
 
@@ -2210,6 +3843,10 @@ async function loadPlayerProfile() {
     $("ppCalcEquity")?.addEventListener("click", () => calculateProfileEquity().catch(console.warn));
     $("ppClearEquityCards")?.addEventListener("click", clearProfileEquityCards);
     $("ppCopyToMainEquity")?.addEventListener("click", copyProfileEquityToMainEquity);
+    $("ppDecisionRefresh")?.addEventListener("click", renderProfileDecisionPanel);
+    ["ppPotChips", "ppCallChips", "ppStackChips"].forEach(id => {
+      $(id)?.addEventListener("input", renderProfileDecisionPanel);
+    });
     ["ppHeroCards", "ppBoardCards"].forEach(id => {
       $(id)?.addEventListener("input", () => {
         syncProfileEquityPickerFromInputs({ manual: true });
@@ -2237,6 +3874,7 @@ async function loadPlayerProfile() {
         .then(() => calculateProfileEquity({ auto: true }))
         .catch(console.warn);
     }
+    renderProfileDecisionPanel();
     startProfileEquityAuto();
   } catch (e) {
     console.error(e);
@@ -2345,7 +3983,7 @@ function renderSessionHands() {
 
   const items = [...sessionHandCache.entries()].sort((a, b) => b[1].ts - a[1].ts);
   if (!items.length) {
-    listEl.innerText = "Ingen hender registrert ennÃ¥.";
+    listEl.innerText = "Ingen hender registrert enna.";
     return;
   }
 
@@ -2354,7 +3992,7 @@ function renderSessionHands() {
       ${items.map(([hid, info]) => `
         <li>
           <a href="#" class="sessionHandLink" data-hand="${hid}">Hand ${hid}</a>
-          â€“ ${escapeHtml(info.summary)}
+          - ${escapeHtml(info.summary)}
         </li>
       `).join("")}
     </ul>
@@ -2840,7 +4478,10 @@ async function loadStartingHands(opts = {}) {
 
 async function saveLiveCardsToCurrentHand(heroCards, boardCards = [], meta = {}) {
   const gamecode = String(meta?.gamecode || meta?.site_hand_id || "").trim();
-  const handId = lastGameState?.hand_id || $("hvHandId")?.value?.trim();
+  const source = String(meta?.source || "");
+  const isScreenSource = source.includes("screen");
+  const explicitHandId = meta?.hand_id || meta?.id || "";
+  const handId = explicitHandId || (!isScreenSource ? (lastGameState?.hand_id || $("hvHandId")?.value?.trim()) : "");
   const hero = (heroCards || []).map(convertBetSolidCard).filter(isCard);
   const board = (boardCards || []).map(convertBetSolidCard).filter(isCard);
   if (hero.length !== 2) return false;
@@ -2890,13 +4531,17 @@ async function saveLiveCardsToCurrentHand(heroCards, boardCards = [], meta = {})
       lastGameState.hand_id = saved.hand_id;
       if ($("hvHandId")) $("hvHandId").value = String(saved.hand_id);
     }
-    if (saved?.session_id && $("shSession")) $("shSession").value = String(saved.session_id);
+    if (saved?.session_id) {
+      syncActiveSessionFields(saved.session_id, "saved-live");
+    }
     const status = $("startingHandsStatus");
     if (status) {
       const handLabel = saved?.hero?.length === 2 ? saved.hero.join(" ") : hero.join(" ");
       status.innerText = `Lagret live hand ${saved?.hand_id || handId}: ${handLabel}`;
     }
     scheduleStartingHandsRefresh("saved-live-cards", key);
+    await refreshBackendCardHistory({ force: true });
+    renderHeroHistoryMatches();
     return true;
   } catch (e) {
     console.warn("Could not save live cards to hand", e);
@@ -2968,12 +4613,12 @@ async function loadThreeBetMatrix() {
 
     const cells = data.cells || [];
     if (!cells.length) {
-      out.innerHTML = `<div style="opacity:.7;">Ingen data for denne spilleren ennÃ¥.</div>`;
+      out.innerHTML = `<div style="opacity:.7;">Ingen data for denne spilleren enna.</div>`;
       return;
     }
 
     // build matrix table
-    let html = `<h3>${escapeHtml(player)} â€“ 3-bet Response Matrix</h3>`;
+    let html = `<h3>${escapeHtml(player)} - 3-bet Response Matrix</h3>`;
     html += `<div style="opacity:.8; margin-bottom:10px;">Total faced: <b>${data.total_faced}</b> | Cells returned: <b>${data.cells_returned}</b> | Recommendation: >=<b>${data.recommended_min_faced}</b> faced per cell</div>`;
 
     html += `<table style="border-collapse:collapse; width:100%; font-size:13px;">`;
@@ -3105,6 +4750,43 @@ function wireDashboard() {
   $("btnSessionHud")?.addEventListener("click", loadSessionHud);
 }
 
+function wireCollapsibleSections() {
+  document.querySelectorAll("section").forEach((section, idx) => {
+    if (section.dataset.collapsibleReady === "1") return;
+    const heading = Array.from(section.children).find(el => /^H[1-4]$/i.test(el.tagName || ""));
+    if (!heading) return;
+
+    section.dataset.collapsibleReady = "1";
+    const title = normalizeSpaces(heading.textContent || `seksjon-${idx}`) || `seksjon-${idx}`;
+    const key = `vinne.section.collapsed.${idx}.${title.slice(0, 40)}`;
+    const collapsed = localStorage.getItem(key) === "1";
+
+    heading.classList.add("section-toggle-head");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "section-toggle-btn";
+    btn.dataset.sectionToggle = "1";
+    heading.appendChild(btn);
+
+    const setCollapsed = (isCollapsed) => {
+      Array.from(section.children).forEach(child => {
+        if (child === heading) return;
+        child.style.display = isCollapsed ? "none" : "";
+      });
+      btn.textContent = isCollapsed ? "Vis" : "Skjul";
+      btn.title = isCollapsed ? "Vis denne delen" : "Skjul denne delen";
+      localStorage.setItem(key, isCollapsed ? "1" : "0");
+    };
+
+    btn.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      setCollapsed(btn.textContent !== "Vis");
+    });
+    setCollapsed(collapsed);
+  });
+}
+
 // ------------------------------
 // Boot
 // ------------------------------
@@ -3129,6 +4811,7 @@ document.addEventListener("DOMContentLoaded", () => {
   safeCall(wireMultiHandComparison, "wireMultiHandComparison");
   safeCall(wireStartingHands, "wireStartingHands");
   safeCall(wirePlayerAutocomplete, "wirePlayerAutocomplete");
+  safeCall(wireCollapsibleSections, "wireCollapsibleSections");
 
   const autoEquityBox = $("autoEquity");
   if (autoEquityBox) autoEquityBox.checked = false;
@@ -3217,9 +4900,11 @@ async function applyLiveScreenCards() {
     if (liveAgeSeconds > 4) {
       lastLiveHeroText = "";
       lastLiveBoardText = "";
+      lastLiveCardsStatus = "Livekort: venter på fersk skjermlesing.";
       pendingScreenHeroText = "";
       pendingScreenHeroCount = 0;
       liveScreenActive = false;
+      renderCardHistory();
       return false;
     }
 
@@ -3227,10 +4912,12 @@ async function applyLiveScreenCards() {
       const autoStatus = $("autoEquityStatus");
       lastLiveHeroText = "";
       lastLiveBoardText = "";
+      lastLiveCardsStatus = `Livekort: lesefeil${cardsData.error ? ` (${cardsData.error})` : ""}`;
       pendingScreenHeroText = "";
       pendingScreenHeroCount = 0;
       liveScreenActive = false;
       if (autoStatus) autoStatus.innerText = "Live: venter på kort.";
+      renderCardHistory();
       return false;
     }
 
@@ -3263,18 +4950,24 @@ async function applyLiveScreenCards() {
 
     liveScreenActive = isScreenSource && (validLiveHero || (Boolean(boardText) && validLiveBoard));
     if (validLiveHero) {
+      if (heroText !== lastLiveHeroText && (!boardText || !validLiveBoard)) {
+        lastLiveBoardText = "";
+      }
       lastLiveHeroText = heroText;
+      lastLiveCardsStatus = `Livekort: ${heroText}`;
       console.log("Live screen hero cards read for history:", heroText);
     }
 
     if (boardText && validLiveBoard) {
       lastLiveBoardText = boardText;
+      lastLiveCardsStatus = `Livekort: ${heroText || "-"} / board ${boardText}`;
       console.log("Live screen board read for history:", boardText);
     }
 
     if (validLiveHero) {
-      try { addCardHistoryEntry(liveHeroCards, validLiveBoard ? liveBoardCards : []); } catch(e) { console.warn(e); }
-      saveLiveCardsToCurrentHand(liveHeroCards, validLiveBoard ? liveBoardCards : [], cardsData).catch(console.warn);
+      const historyBoardCards = validLiveBoard && liveBoardCards.length ? liveBoardCards : [];
+      try { addCardHistoryEntry(liveHeroCards, historyBoardCards, "screen-live"); } catch(e) { console.warn(e); }
+      saveLiveCardsToCurrentHand(liveHeroCards, historyBoardCards, cardsData).catch(console.warn);
     }
 
     if (validLiveHero || (Boolean(boardText) && validLiveBoard)) {
@@ -3285,7 +4978,11 @@ async function applyLiveScreenCards() {
     return validLiveHero || (Boolean(boardText) && validLiveBoard);
   } catch (e) {
     console.warn("Could not read current_live_cards.json");
+    lastLiveHeroText = "";
+    lastLiveBoardText = "";
+    lastLiveCardsStatus = "Livekort: kunne ikke hente skjermlesing.";
     liveScreenActive = false;
+    renderCardHistory();
     return false;
   }
 }
@@ -3302,16 +4999,16 @@ async function pollCurrentGame() {
   try {
 console.time("latest-with-stats");
 
-const timeout = new Promise((_, reject) =>
-  setTimeout(() => reject(new Error("Timeout after 10s")), 30000)
-);
-
-const fetchPromise = fetch(
-  `${apiBase()}/hands/latest/with-adaptive-stats`
-);
+const controller = new AbortController();
+const timeout = setTimeout(() => controller.abort("Timeout after 6s"), 6000);
 
 console.log("ðŸš€ BEFORE race");
-const res = await Promise.race([fetchPromise, timeout]);
+let res;
+try {
+  res = await fetch(`${apiBase()}/hands/latest/with-adaptive-stats`, { signal: controller.signal });
+} finally {
+  clearTimeout(timeout);
+}
 console.log("âœ… AFTER race");
 
 console.timeEnd("latest-with-stats");
@@ -3323,6 +5020,7 @@ console.timeEnd("latest-with-stats");
       
       const data = await res.json();
       console.log("ðŸ“¡ got adaptive stats:", data);
+      if (data?.session_id) syncActiveSessionFields(data.session_id, "poll");
       await applyLiveScreenCards();
 
       // Sjekk om board har endra
@@ -3394,8 +5092,10 @@ const previousHandId = lastGameState.hand_id;
 
 // AUTO-UPDATE HAND_ID IN LIVE COACH IF NEW HAND DETECTED
 if (data.hand_id && data.hand_id !== previousHandId) {
+  lastManualBoardText = "";
+  lastLiveBoardText = "";
   await autoLoadCurrentHandFeatures(data);
-  if ($("shSession") && data.session_id) $("shSession").value = String(data.session_id);
+  if (data.session_id) syncActiveSessionFields(data.session_id, "new-hand");
   scheduleStartingHandsRefresh("new-hand", `hand-${data.hand_id}`);
   console.log(`Auto-updated current-hand features for hand_id: ${data.hand_id}`);
 }
@@ -3410,7 +5110,7 @@ lastGameState = {
 await applyLiveScreenCards();
 if (lastLiveHeroText) {
   const heroCards = parseCards(lastLiveHeroText);
-  const boardCards = parseCards(lastLiveBoardText || "");
+  const boardCards = parseCards(lastLiveBoardText || "").filter(isCard).slice(0, 5);
   if (heroCards.length === 2 && heroCards.every(isCard)) {
     await saveLiveCardsToCurrentHand(heroCards, boardCards.every(isCard) ? boardCards : [], lastLiveCardsMeta);
   }
