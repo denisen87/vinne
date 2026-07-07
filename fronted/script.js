@@ -32,7 +32,34 @@ function renderLiveStatusWithCapture(text) {
   if (!capture) return escapeHtml(text);
   const before = text.slice(0, text.indexOf(`capture=${capture}`));
   const after = text.slice(text.indexOf(`capture=${capture}`) + `capture=${capture}`.length);
-  return `${escapeHtml(before)}capture=<code style="user-select:all; background:#fff7ed; border:1px solid #fed7aa; border-radius:4px; padding:1px 4px;">${escapeHtml(capture)}</code><button type="button" id="copyLiveCapture" data-capture="${escapeHtml(capture)}" title="Kopier capture-filnavn" style="margin-left:6px; padding:2px 8px; border:1px solid #d6d3d1; background:#fff; border-radius:4px; cursor:pointer; font-size:11px;">Kopier</button>${escapeHtml(after)}`;
+  const command = `& "C:\\Program Files\\Python311\\python.exe" .github\\vinne\\screen_reader.py --calibrate-file "fronted\\calibration_captures\\${capture}" "SKRIV_KORT_HER"`;
+  return `${escapeHtml(before)}capture=<code style="user-select:all; background:#fff7ed; border:1px solid #fed7aa; border-radius:4px; padding:1px 4px;">${escapeHtml(capture)}</code><button type="button" id="copyLiveCapture" data-capture="${escapeHtml(capture)}" title="Kopier capture-filnavn" style="margin-left:6px; padding:2px 8px; border:1px solid #d6d3d1; background:#fff; border-radius:4px; cursor:pointer; font-size:11px;">Kopier fil</button>${escapeHtml(after)}<div style="margin-top:6px;"><code style="user-select:all; display:inline-block; max-width:100%; overflow-wrap:anywhere; background:#f8fafc; border:1px solid #cbd5e1; border-radius:4px; padding:4px 6px;">${escapeHtml(command)}</code><button type="button" id="copyLiveCalibrateCommand" data-command="${escapeHtml(command)}" title="Kopier kalibreringskommando" style="margin-left:6px; padding:3px 8px; border:1px solid #d6d3d1; background:#fff; border-radius:4px; cursor:pointer; font-size:11px;">Kopier kommando</button></div>`;
+}
+
+function wireLiveCaptureButtons() {
+  const copyCaptureBtn = $("copyLiveCapture");
+  if (copyCaptureBtn) copyCaptureBtn.addEventListener("click", async () => {
+    const capture = copyCaptureBtn.dataset.capture || "";
+    if (!capture) return;
+    try {
+      await navigator.clipboard.writeText(capture);
+      copyCaptureBtn.innerText = "Kopiert";
+    } catch (e) {
+      window.prompt("Kopier capture-filnavn:", capture);
+    }
+  });
+
+  const copyCommandBtn = $("copyLiveCalibrateCommand");
+  if (copyCommandBtn) copyCommandBtn.addEventListener("click", async () => {
+    const command = copyCommandBtn.dataset.command || "";
+    if (!command) return;
+    try {
+      await navigator.clipboard.writeText(command);
+      copyCommandBtn.innerText = "Kopiert";
+    } catch (e) {
+      window.prompt("Kopier kalibreringskommando:", command);
+    }
+  });
 }
 
 function apiBase() {
@@ -50,8 +77,10 @@ let manualLiveMode = false;
 let liveScreenActive = false;
 let lastLiveHeroText = "";
 let lastLiveBoardText = "";
+let lastManualHeroText = "";
 let lastManualBoardText = "";
 let lastLiveCardsStatus = "Livekort: ikke lest ennå.";
+let lastLiveCardsSeenAt = 0;
 let pendingScreenHeroText = "";
 let pendingScreenHeroCount = 0;
 let startingHandsInFlight = false;
@@ -60,6 +89,7 @@ let startingHandsFallbackTimer = null;
 let lastStartingHandsRefreshKey = "";
 let lastSavedLiveCardsKey = "";
 let lastLiveCardsMeta = {};
+let lastLiveCardsGameKey = "";
 let knownPlayerNames = [];
 let playerNamesLoaded = false;
 let playerNameSearchTimer = null;
@@ -75,8 +105,23 @@ let ppLastDecisionState = null;
 let backendCardHistory = [];
 let backendCardHistoryLoadedAt = 0;
 let backendCardHistoryInFlight = false;
+let backendCardHistoryStartedAt = 0;
+let backendCardHistoryLastAttemptAt = 0;
+let backendCardHistorySessionId = "";
+let backendCardHistoryWatchdogTimer = null;
+let backendCardHistoryPendingRender = false;
 let backendCardHistoryError = "";
 const BACKEND_CARD_HISTORY_TTL_MS = 3000;
+
+function clearMainHeroForNewLiveHand() {
+  const heroEl = $("hero");
+  const heroRegisterInput = $("heroRegisterInput");
+  if (heroEl) heroEl.value = "";
+  if (heroRegisterInput) heroRegisterInput.value = "";
+  lastManualHeroText = "";
+  heroCorrectionCards = [];
+  if (typeof renderHeroCorrection === "function") renderHeroCorrection();
+}
 
 function dashSessionId() {
   const v = $("dashSession")?.value?.trim();
@@ -826,7 +871,7 @@ function dedupeHeroBoardMatchHistory(list) {
   const out = [];
   for (const raw of list || []) {
     const entry = normalizeHeroBoardMatchEntry(raw);
-    if (entry.hero.length !== 2 || !entry.board.length || !entry.hits.length) continue;
+    if (entry.hero.length !== 2 || !entry.board.length) continue;
     const key = heroBoardMatchHistoryKey(entry);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -841,7 +886,8 @@ function dedupeHeroBoardMatchHistory(list) {
 
 function normalizeBackendCardHistoryEntry(entry, index = null) {
   const cards = Array.isArray(entry?.cards) ? entry.cards : entry?.hero;
-  const started = entry?.started_at ? Date.parse(entry.started_at) : NaN;
+  const rawStarted = entry?.started_at || entry?.at || "";
+  const started = rawStarted ? Date.parse(String(rawStarted).replace(" ", "T")) : NaN;
   return normalizeHistoryEntry({
     hero: (cards || []).map(convertBetSolidCard),
     board: (entry?.board || []).map(convertBetSolidCard),
@@ -856,28 +902,79 @@ function normalizeBackendCardHistoryEntry(entry, index = null) {
   });
 }
 
+function validHistoryIndex(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function sortCardHistoryNewestFirst(list) {
+  return [...(list || [])].sort((a, b) => {
+    const ai = validHistoryIndex(a?.overall_index);
+    const bi = validHistoryIndex(b?.overall_index);
+    if (ai !== null && bi !== null && ai !== bi) return ai - bi;
+    const siteDiff = Number(b.site_hand_id || 0) - Number(a.site_hand_id || 0);
+    if (siteDiff) return siteDiff;
+    const handDiff = Number(b.hand_id || 0) - Number(a.hand_id || 0);
+    if (handDiff) return handDiff;
+    return Number(b.at || 0) - Number(a.at || 0);
+  });
+}
+
 function combinedCardHistory() {
-  const localHistory = loadCardHistory();
-  const usableLocalHistory = backendCardHistory.length ? [] : localHistory;
-  return dedupeCardHistory([
-    ...backendCardHistory,
-    ...usableLocalHistory
-  ].map(normalizeHistoryEntry).sort((a, b) => Number(b.at || 0) - Number(a.at || 0)));
+  return sortCardHistoryNewestFirst(dedupeCardHistory(
+    backendCardHistory.map(normalizeHistoryEntry)
+  ));
+}
+
+function isHistoricalMatchSource(entry) {
+  return String(entry?.source || "").toLowerCase() === "backend";
+}
+
+function isLocalHistoricalMatchSource(entry) {
+  const source = String(entry?.source || "").toLowerCase();
+  return isHistoricalMatchSource(entry) && source !== "backend";
+}
+
+function historyEntriesWithBoards(list) {
+  return (list || []).filter(entry => (entry.board || []).map(convertBetSolidCard).filter(isCard).length > 0);
 }
 
 async function refreshBackendCardHistory(opts = {}) {
   const now = Date.now();
-  if (!opts.force && backendCardHistoryLoadedAt && now - backendCardHistoryLoadedAt < BACKEND_CARD_HISTORY_TTL_MS) {
+  const historySessionKey = "file-history-all-db-registered-hero-pairlock-20260707f";
+  if (
+    !opts.force &&
+    backendCardHistoryLoadedAt &&
+    backendCardHistorySessionId === historySessionKey &&
+    now - backendCardHistoryLoadedAt < BACKEND_CARD_HISTORY_TTL_MS
+  ) {
     return backendCardHistory;
   }
-  if (backendCardHistoryInFlight) return backendCardHistory;
+  if (backendCardHistoryInFlight) {
+    if (opts.render !== false) backendCardHistoryPendingRender = true;
+    return backendCardHistory;
+  }
   backendCardHistoryInFlight = true;
+  backendCardHistoryStartedAt = Date.now();
+  backendCardHistoryLastAttemptAt = backendCardHistoryStartedAt;
   backendCardHistoryError = "";
+  let shouldRender = opts.render !== false;
+  if (backendCardHistoryWatchdogTimer) clearTimeout(backendCardHistoryWatchdogTimer);
+  backendCardHistoryWatchdogTimer = setTimeout(() => {
+    if (!backendCardHistoryInFlight) return;
+    backendCardHistoryInFlight = false;
+    backendCardHistoryStartedAt = 0;
+    backendCardHistoryError = "timeout";
+    backendCardHistoryPendingRender = false;
+    renderCardHistory();
+    renderHeroHistoryMatches({ skipBackendRefresh: true });
+  }, (opts.timeoutMs || 5000) + 1500);
   try {
     const params = new URLSearchParams();
     const heroName = dashHero();
     if (heroName) params.set("player_name", heroName);
-    params.set("limit", String(opts.limit || 200));
+    params.set("limit", String(opts.limit || 1000));
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), opts.timeoutMs || 5000);
     let res;
@@ -888,21 +985,27 @@ async function refreshBackendCardHistory(opts = {}) {
     }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    backendCardHistory = (data.history || [])
-      .map((entry, index) => normalizeBackendCardHistoryEntry(entry, index))
-      .filter(e => e.hero.length === 2);
+    backendCardHistory = sortCardHistoryNewestFirst((data.history || [])
+      .map(entry => normalizeBackendCardHistoryEntry(entry))
+      .filter(e => e.hero.length === 2))
+      .map((entry, index) => ({ ...entry, overall_index: index }));
+    backendCardHistorySessionId = historySessionKey;
     backendCardHistoryLoadedAt = Date.now();
-    backendCardHistory.forEach(entry => {
-      if (entry.board && entry.board.length) {
-        saveHeroBoardMatchHistory(entry.hero, entry.board, entry.source || "backend", entry);
-      }
-    });
     renderHeroHistoryMatches({ skipBackendRefresh: true });
   } catch (e) {
     backendCardHistoryError = e?.name === "AbortError" ? "timeout" : String(e?.message || e);
     console.warn("Could not load backend card history", e);
   } finally {
     backendCardHistoryInFlight = false;
+    backendCardHistoryStartedAt = 0;
+    if (backendCardHistoryWatchdogTimer) {
+      clearTimeout(backendCardHistoryWatchdogTimer);
+      backendCardHistoryWatchdogTimer = null;
+    }
+  }
+  if (shouldRender || backendCardHistoryPendingRender) {
+    backendCardHistoryPendingRender = false;
+    renderCardHistory();
   }
   return backendCardHistory;
 }
@@ -917,10 +1020,35 @@ function heroComboKey(cards) {
     .join("|");
 }
 
+function heroExactKey(cards) {
+  return (cards || [])
+    .map(convertBetSolidCard)
+    .filter(isCard)
+    .slice(0, 2)
+    .sort()
+    .join("|");
+}
+
+function boardExactKey(cards) {
+  return (cards || [])
+    .map(convertBetSolidCard)
+    .filter(isCard)
+    .slice(0, 5)
+    .join("|");
+}
+
+function heroRankKey(cards) {
+  return (cards || [])
+    .map(convertBetSolidCard)
+    .filter(isCard)
+    .slice(0, 2)
+    .map(card => card[0])
+    .sort()
+    .join("|");
+}
+
 function activeHistorySessionId() {
   const candidates = [
-    lastGameState?.session_id,
-    lastLiveCardsMeta?.session_id,
     $("shSession")?.value,
     $("dashSession")?.value,
     $("lhSession")?.value
@@ -965,6 +1093,123 @@ function simpleMatchAgeLabel(index) {
   return rounds === 1 ? "1 runde siden" : `${rounds} runder siden`;
 }
 
+function historyAgeLabel(item) {
+  if (!item) return "-";
+  if (item.manual) return "manuelt registrert";
+  if (item.derivedBoardCache && item.overallHistoryIndex == null && item.roundAgeIndex == null) {
+    return "ukjent rundeavstand";
+  }
+  const idx = Number(item.overallHistoryIndex ?? item.roundAgeIndex ?? item.historyIndex ?? item.index ?? 0);
+  const rounds = idx + 1;
+  return rounds === 1 ? "1 lagret runde siden" : `${rounds} lagrede runder siden`;
+}
+
+function boardHandsSinceLabel(item) {
+  if (!item) return "-";
+  if (item.manual) return "manuelt registrert";
+  if (item.derivedBoardCache && item.overallHistoryIndex == null && item.roundAgeIndex == null) {
+    return "ukjent";
+  }
+  const rounds = Number(item.overallHistoryIndex ?? item.roundAgeIndex ?? item.historyIndex ?? item.index ?? 0) + 1;
+  return rounds === 1 ? "1 runde siden" : `${rounds} runder siden`;
+}
+
+function latestBoardHitLabel(matches) {
+  const item = matches && matches.length ? matches[0] : null;
+  if (!item) return "-";
+  const label = boardHandsSinceLabel(item);
+  return item.hit ? `${label} (${item.hit})` : label;
+}
+
+function latestBoardSourceLabel(matches, opts = {}) {
+  const item = matches && matches.length ? matches[0] : null;
+  if (!item || !item.board || !item.board.length) return "-";
+  const id = item.site_hand_id || item.hand_id || "";
+  const idText = id ? ` #${id}` : "";
+  const showHero = opts.showHero !== false;
+  const heroText = showHero && item.hero && item.hero.length ? `${item.hero.join(" ")} | board: ` : "board: ";
+  return `${heroText}${item.board.join(" ")}${idText}`;
+}
+
+function buildHeroBoardRankStats(heroCards, historyList) {
+  const heroRanks = [...new Set((heroCards || []).map(card => card[0]))];
+  const rankMatches = {};
+  heroRanks.forEach(rank => {
+    rankMatches[rank] = [];
+  });
+
+  let boardRows = 0;
+  (historyList || []).forEach((entry, index) => {
+    const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+    const board = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+    if (entryHero.length !== 2 || !board.length) return;
+    boardRows += 1;
+
+    const entryHeroRanks = new Set(entryHero.map(card => card[0]));
+    const boardRanks = new Set(board.map(card => card[0]));
+    heroRanks.forEach(rank => {
+      if (!entryHeroRanks.has(rank)) return;
+      if (!boardRanks.has(rank)) return;
+      rankMatches[rank].push({
+        rank,
+        hero: entryHero,
+        board,
+        historyIndex: index,
+        roundAgeIndex: index,
+        overallHistoryIndex: index,
+        hand_id: entry.hand_id || "",
+        site_hand_id: entry.site_hand_id || "",
+        session_id: entry.session_id || ""
+      });
+    });
+  });
+
+  const singleHits = [];
+  const comboHits = [];
+  (historyList || []).forEach((entry, index) => {
+    const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+    const board = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+    if (entryHero.length !== 2 || !board.length) return;
+    const entryHeroRanks = new Set(entryHero.map(card => card[0]));
+    const boardRanks = new Set(board.map(card => card[0]));
+    const hits = heroRanks.filter(rank => entryHeroRanks.has(rank) && boardRanks.has(rank));
+    if (hits.length === 1) {
+      singleHits.push({
+        hit: hits[0],
+        hero: entryHero,
+        board,
+        historyIndex: index,
+        roundAgeIndex: index,
+        overallHistoryIndex: index,
+        hand_id: entry.hand_id || "",
+        site_hand_id: entry.site_hand_id || "",
+        session_id: entry.session_id || ""
+      });
+    }
+    if (heroRanks.length > 1 && hits.length === heroRanks.length) {
+      comboHits.push({
+        hit: heroRanks.join(" + "),
+        hero: entryHero,
+        board,
+        historyIndex: index,
+        roundAgeIndex: index,
+        overallHistoryIndex: index,
+        hand_id: entry.hand_id || "",
+        site_hand_id: entry.site_hand_id || "",
+        session_id: entry.session_id || ""
+      });
+    }
+  });
+
+  return {
+    heroRanks,
+    boardRows,
+    rankMatches,
+    singleHits,
+    comboHits
+  };
+}
+
 function sameHeroMatchSummary(indexes) {
   return matchSummaryWithLabel(indexes, sameHeroSinceLabel);
 }
@@ -974,10 +1219,10 @@ function sameHeroHitSummary(matches) {
   if (!list.length) {
     return { latest: "-", recent: "", extra: 0 };
   }
-  const shown = list.slice(0, 5).map(item => `${item.hit} ${simpleMatchAgeLabel(item.historyIndex ?? item.index)}`);
+  const shown = list.slice(0, 5).map(item => `${item.hit} ${historyAgeLabel(item)}`);
   const extra = Math.max(0, list.length - shown.length);
   return {
-    latest: simpleMatchAgeLabel(list[0].historyIndex ?? list[0].index),
+    latest: historyAgeLabel(list[0]),
     recent: `${shown.join(", ")}${extra ? `, +${extra} flere` : ""}`,
     extra
   };
@@ -988,10 +1233,10 @@ function sameHeroBoardSummary(matches) {
   if (!list.length) {
     return { latest: "-", recent: "", extra: 0 };
   }
-  const shown = list.slice(0, 5).map(item => `${item.rank} ${simpleMatchAgeLabel(item.historyIndex ?? item.index)}`);
+  const shown = list.slice(0, 5).map(item => `${item.rank} ${historyAgeLabel(item)}`);
   const extra = Math.max(0, list.length - shown.length);
   return {
-    latest: simpleMatchAgeLabel(list[0].historyIndex ?? list[0].index),
+    latest: historyAgeLabel(list[0]),
     recent: `${shown.join(", ")}${extra ? `, +${extra} flere` : ""}`,
     extra
   };
@@ -1031,6 +1276,155 @@ function madeHandTone(name, count) {
   return "#fff7ed";
 }
 
+const RANK_STRAIGHT_VALUES = {
+  "2": 2,
+  "3": 3,
+  "4": 4,
+  "5": 5,
+  "6": 6,
+  "7": 7,
+  "8": 8,
+  "9": 9,
+  "T": 10,
+  "J": 11,
+  "Q": 12,
+  "K": 13,
+  "A": 14
+};
+
+function straightHighValue(cards) {
+  const values = new Set((cards || [])
+    .map(card => RANK_STRAIGHT_VALUES[String(card || "")[0]])
+    .filter(Boolean));
+  if (values.has(14)) values.add(1);
+
+  for (let high = 14; high >= 5; high -= 1) {
+    let hasStraight = true;
+    for (let value = high - 4; value <= high; value += 1) {
+      if (!values.has(value)) {
+        hasStraight = false;
+        break;
+      }
+    }
+    if (hasStraight) return high;
+  }
+  return null;
+}
+
+function straightWindowValues(high) {
+  if (!high) return [];
+  if (high === 5) return [1, 2, 3, 4, 5];
+  return [high - 4, high - 3, high - 2, high - 1, high];
+}
+
+function cardStraightValues(card) {
+  const value = RANK_STRAIGHT_VALUES[String(card || "")[0]];
+  if (!value) return [];
+  return value === 14 ? [14, 1] : [value];
+}
+
+function heroRankInStraight(heroCards, high) {
+  const windowValues = new Set(straightWindowValues(high));
+  return (heroCards || []).some(card =>
+    cardStraightValues(card).some(value => windowValues.has(value))
+  );
+}
+
+function straightHighValueWithHero(cards, heroCards) {
+  const values = new Set((cards || [])
+    .map(card => RANK_STRAIGHT_VALUES[String(card || "")[0]])
+    .filter(Boolean));
+  if (values.has(14)) values.add(1);
+
+  for (let high = 14; high >= 5; high -= 1) {
+    const needed = straightWindowValues(high);
+    if (needed.every(value => values.has(value)) && heroRankInStraight(heroCards, high)) {
+      return high;
+    }
+  }
+  return null;
+}
+
+function rankCounts(cards) {
+  const counts = {};
+  (cards || []).forEach(card => {
+    const rank = String(card || "")[0];
+    if (rank) counts[rank] = (counts[rank] || 0) + 1;
+  });
+  return counts;
+}
+
+function hasDuplicateCards(cards) {
+  const seen = new Set();
+  for (const card of cards || []) {
+    if (seen.has(card)) return true;
+    seen.add(card);
+  }
+  return false;
+}
+
+function bestMadeHandForHeroBoard(heroCards, boardCards) {
+  const hero = (heroCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
+  const board = (boardCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+  if (hero.length !== 2 || board.length < 3) return null;
+  if (hasDuplicateCards(hero.concat(board))) return null;
+
+  const allCards = hero.concat(board);
+  const heroRankSet = new Set(hero.map(card => card[0]));
+  const boardRankSet = new Set(board.map(card => card[0]));
+  const heroBoardMatchedRanks = [...heroRankSet].filter(rank => boardRankSet.has(rank));
+  const suits = ["s", "h", "d", "c"];
+  for (const suit of suits) {
+    const suitedCards = allCards.filter(card => card[1] === suit);
+    const suitedHeroCards = hero.filter(card => card[1] === suit);
+    const sfHigh = suitedCards.length >= 5 && suitedHeroCards.length
+      ? straightHighValueWithHero(suitedCards, suitedHeroCards)
+      : null;
+    if (sfHigh) return { name: "Straight Flush", suffix: sfHigh === 14 ? " A" : ` ${sfHigh}` };
+  }
+
+  const counts = rankCounts(allCards);
+  const ranksByCount = Object.keys(counts);
+  const tripsRanks = ranksByCount.filter(rank => counts[rank] >= 3);
+  const pairRanks = ranksByCount.filter(rank => counts[rank] >= 2);
+  const quadRank = ranksByCount.find(rank => counts[rank] >= 4 && heroBoardMatchedRanks.includes(rank));
+  if (quadRank) {
+    return { name: "Four of a Kind", suffix: ` ${quadRank}` };
+  }
+  let fullHouseMatch = null;
+  for (const tripsRank of tripsRanks) {
+    const pairRank = pairRanks.find(rank =>
+      rank !== tripsRank &&
+      (heroBoardMatchedRanks.includes(tripsRank) || heroBoardMatchedRanks.includes(rank))
+    );
+    if (pairRank) {
+      fullHouseMatch = { tripsRank, pairRank };
+      break;
+    }
+  }
+  if (fullHouseMatch) {
+    return { name: "Full House", suffix: ` ${fullHouseMatch.tripsRank}+${fullHouseMatch.pairRank}` };
+  }
+
+  const hasFlush = suits.some(suit =>
+    allCards.filter(card => card[1] === suit).length >= 5 &&
+    hero.some(card => card[1] === suit)
+  );
+  if (hasFlush) return { name: "Flush" };
+
+  const straightHigh = straightHighValueWithHero(allCards, hero);
+  if (straightHigh) return { name: "Straight", suffix: straightHigh === 14 ? " A" : ` ${straightHigh}` };
+
+  const heroTripsRank = tripsRanks.find(rank => heroBoardMatchedRanks.includes(rank));
+  if (heroTripsRank) return { name: "Three of a Kind", suffix: ` ${heroTripsRank}` };
+  const madePairRanks = pairRanks.filter(rank => heroBoardMatchedRanks.includes(rank));
+  if (madePairRanks.length >= 2) return { name: "Two Pair", suffix: ` ${madePairRanks.slice(0, 2).join("+")}` };
+  if (madePairRanks.length === 1) {
+    return { name: "Pair", suffix: ` ${madePairRanks[0]}` };
+  }
+  return { name: "High Card" };
+}
+
 function heroRankMadeHandSignals(heroCards, boardCards) {
   const hero = (heroCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
   const board = (boardCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
@@ -1046,6 +1440,21 @@ function heroRankMadeHandSignals(heroCards, boardCards) {
   board.forEach(card => { boardSuitCounts[card[1]] = (boardSuitCounts[card[1]] || 0) + 1; });
 
   const signals = [];
+  const combinedCounts = {};
+  hero.concat(board).forEach(card => {
+    combinedCounts[card[0]] = (combinedCounts[card[0]] || 0) + 1;
+  });
+  const heroRankSet = new Set(Object.keys(heroCounts));
+  const tripsRanks = Object.keys(combinedCounts).filter(rank => combinedCounts[rank] >= 3);
+  const pairRanks = Object.keys(combinedCounts).filter(rank => combinedCounts[rank] >= 2);
+  const fullHouseRank = tripsRanks.find(tripsRank =>
+    pairRanks.some(pairRank => pairRank !== tripsRank) &&
+    (heroRankSet.has(tripsRank) || pairRanks.some(pairRank => pairRank !== tripsRank && heroRankSet.has(pairRank)))
+  );
+  if (fullHouseRank) {
+    signals.push({ name: "Full House", rank: fullHouseRank });
+  }
+
   Object.keys(heroCounts).forEach(rank => {
     const boardCount = boardCounts[rank] || 0;
     if (!boardCount) return;
@@ -1074,116 +1483,138 @@ function heroRankMadeHandSignals(heroCards, boardCards) {
       signals.push({ name: "Flush", suit });
     }
   });
+
+  const allCards = hero.concat(board);
+  const straightHigh = straightHighValue(allCards);
+  if (straightHigh) {
+    signals.push({ name: "Straight", rank: straightHigh === 14 ? "A" : String(straightHigh) });
+  }
+
+  const suits = ["s", "h", "d", "c"];
+  for (const suit of suits) {
+    const suitedCards = allCards.filter(card => card[1] === suit);
+    if (suitedCards.length >= 5 && straightHighValue(suitedCards)) {
+      signals.push({ name: "Straight Flush", suit });
+      break;
+    }
+  }
   return signals;
+}
+
+function madeHandSignalText(signals) {
+  const list = signals || [];
+  if (!list.length) return "";
+  return list
+    .map(signal => signal.rank
+      ? `${madeHandLabel(signal.name)} ${signal.rank}`
+      : madeHandLabel(signal.name))
+    .join(" / ");
+}
+
+function activeManualHeroCardsForHistory() {
+  const sources = [
+    lastManualHeroText,
+    cardsToText(manualPickerHeroCards),
+    $("heroRegisterInput")?.value || "",
+    $("hero")?.value || ""
+  ];
+  for (const raw of sources) {
+    const cards = parseCards(raw || "").filter(isCard).slice(0, 2);
+    if (cards.length === 2) return cards;
+  }
+  return [];
 }
 
 function renderHeroHistoryMatches(opts = {}) {
   const box = $("heroHistoryMatchBox");
   if (!box) return;
-  if (!opts.skipBackendRefresh) {
-    refreshBackendCardHistory().catch(console.warn);
-  }
 
-  const heroCards = parseCards($("hero")?.value || "").filter(isCard).slice(0, 2);
+  const heroCards = activeManualHeroCardsForHistory();
   if (heroCards.length !== 2) {
     box.innerHTML = `<div style="opacity:.65;">Historikkmatch: legg inn 2 hero-kort.</div>`;
     return;
   }
 
-  if (backendCardHistoryInFlight && !backendCardHistory.length) {
-    box.innerHTML = `<div style="opacity:.65;">Historikkmatch: laster database...</div>`;
-    return;
+  if (!opts.skipBackendRefresh) {
+    refreshBackendCardHistory({ limit: 100, timeoutMs: 15000, render: true }).catch(console.warn);
   }
 
-  const activeSessionId = activeHistorySessionId();
-  const allHistory = combinedCardHistory();
-  const list = allHistory;
-  if (!list.length) {
-    box.innerHTML = `<div style="opacity:.65;">Historikkmatch: ingen tidligere runder lagret.</div>`;
-    return;
-  }
+  const backendHistoryForMatch = sortCardHistoryNewestFirst(
+    backendCardHistory.map(normalizeHistoryEntry)
+  )
+    .filter(isHistoricalMatchSource)
+    .map((entry, index) => ({
+      ...entry,
+      history_order_index: index,
+      overall_index: index
+    }));
+  const backendBoardHands = historyEntriesWithBoards(backendHistoryForMatch);
+  const list = backendHistoryForMatch;
+  const matchSourceLabel = backendBoardHands.length
+    ? "database/filhistorikk"
+    : backendCardHistoryInFlight
+      ? "laster database/filhistorikk"
+      : backendCardHistoryError
+        ? `database/filhistorikk feilet: ${backendCardHistoryError}`
+        : "database/filhistorikk uten board";
+  const storedHeroHands = list.filter(entry => (entry.hero || []).map(convertBetSolidCard).filter(isCard).length === 2).length;
+  const storedBoardHands = list.filter(entry => (entry.board || []).map(convertBetSolidCard).filter(isCard).length > 0).length;
+  const historyNotice = !list.length
+    ? (backendCardHistoryInFlight ? "Laster database/filhistorikk..." : "Ingen filhistorikk lagret.")
+    : backendCardHistoryInFlight && !backendBoardHands.length
+      ? "Laster database/filhistorikk og boardkort..."
+      : "";
 
-  const currentBoardCards = liveBoardFallbackCards();
   const minHistoricalBoardCards = 1;
-  const currentBoardRanks = new Set(currentBoardCards.map(card => card[0]));
-  const currentHeroRanks = [...new Set(heroCards.map(card => card[0]))];
-  const currentHits = currentHeroRanks.map(rank => ({
-    rank,
-    hit: currentBoardRanks.has(rank)
-  }));
-  const currentHitText = currentBoardCards.length
-    ? currentHits.map(item => `${item.rank} ${item.hit ? "matcher" : "matcher ikke"}`).join(", ")
-    : "legg inn board for nå-match";
 
-  const heroKey = heroComboKey(heroCards);
+  const heroKey = heroExactKey(heroCards);
   const heroRanks = [...new Set(heroCards.map(card => card[0]))];
-  const rankStats = Object.fromEntries(heroRanks.map(rank => [rank, { attempts: 0, matches: 0, indexes: [], details: [] }]));
-  const comboIndexes = [];
-  const anyHitIndexes = [];
-  const comboMatches = [];
-  const anyHitMatches = [];
   const sameHeroHands = [];
   const olderSameHeroHands = [];
   let allBoardCount = 0;
   let sameHeroWithBoardCount = 0;
 
-  list.forEach((entry, historyIndex) => {
-    const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
-    if (entryHero.length !== 2) return;
-    const entryBoard = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
-    if (!entryBoard.length) return;
-    const entryHeroRanks = new Set(entryHero.map(card => card[0]));
-    const boardRanks = new Set(entryBoard.map(card => card[0]));
-    heroRanks.forEach(rank => {
-      if (!entryHeroRanks.has(rank)) return;
-      rankStats[rank].attempts += 1;
-      if (!boardRanks.has(rank)) return;
-      rankStats[rank].matches += 1;
-      rankStats[rank].indexes.push(historyIndex);
-      rankStats[rank].details.push({
-        index: historyIndex,
-        historyIndex,
-        rank,
-        matchedBoard: entryBoard.filter(card => card[0] === rank),
-        source: entry.source || (entry.hand_id ? "database" : "lokal"),
-        hand_id: entry.hand_id || "",
-        site_hand_id: entry.site_hand_id || ""
-      });
-    });
-  });
-
-  const collectSameHeroRows = (sourceList, includeStats) => {
+  const collectSameHeroRows = (sourceList, includeStats, matchMode = "exact") => {
     const rows = [];
     sourceList.forEach((entry, historyIndex) => {
     const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
     if (entryHero.length !== 2) return;
 
     const entryBoard = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+    const manualEntry = String(entry.site_hand_id || "").startsWith("manual-") || String(entry.source || "").includes("manual");
+    const entryOverallIndex = validHistoryIndex(entry.history_order_index ?? entry.overall_index);
+    const hasOverallIndex = entryOverallIndex !== null;
+    const derivedWithoutOrder = Boolean(entry.derived_board_cache && !hasOverallIndex);
+    const historyAgeIndex = hasOverallIndex ? entryOverallIndex : historyIndex;
+    const ageMeta = derivedWithoutOrder
+      ? { derivedBoardCache: true }
+      : { roundAgeIndex: historyAgeIndex, overallHistoryIndex: historyAgeIndex };
+
+    const entryHeroRanks = new Set(entryHero.map(card => card[0]));
+    const boardRanks = new Set(entryBoard.map(card => card[0]));
+
+    if (matchMode === "exact" && heroExactKey(entryHero) !== heroKey) return;
+    if (matchMode === "rank" && heroRankKey(entryHero) !== heroRankKey(heroCards)) return;
+    if (matchMode === "any-rank" && !heroRanks.some(rank => entryHeroRanks.has(rank))) return;
     if (!entryBoard.length) return;
     if (entryBoard.length < minHistoricalBoardCards) return;
 
-    const boardRanks = new Set(entryBoard.map(card => card[0]));
-    if (includeStats) allBoardCount += 1;
+    const relevantHeroRanks = heroRanks.filter(rank => entryHeroRanks.has(rank));
+    const hitRanks = relevantHeroRanks.filter(rank => boardRanks.has(rank));
+    if (matchMode === "all-boards" && !hitRanks.length) return;
 
-    if (heroComboKey(entryHero) !== heroKey) return;
+    if (includeStats) allBoardCount += 1;
 
     const boardIndex = includeStats ? sameHeroWithBoardCount : rows.length;
     if (includeStats) sameHeroWithBoardCount += 1;
-    const hitRanks = heroRanks.filter(rank => boardRanks.has(rank));
-    const bothHeroRanksOnBoard = heroRanks.every(rank => boardRanks.has(rank));
-    if (includeStats && bothHeroRanksOnBoard) {
-      comboIndexes.push(boardIndex);
-      comboMatches.push({ index: boardIndex, historyIndex, hit: heroRanks.join(" + ") });
-    }
-    if (includeStats && hitRanks.length) {
-      anyHitIndexes.push(boardIndex);
-      anyHitMatches.push({ index: boardIndex, historyIndex, hit: hitRanks.join(" / ") });
-    }
 
     rows.push({
-      index: boardIndex,
-      historyIndex,
-      label: Number.isInteger(entry.overall_index) ? simpleMatchAgeLabel(entry.overall_index) : sameHeroSinceLabel(boardIndex),
+      index: historyAgeIndex,
+      boardMatchIndex: boardIndex,
+      historyIndex: historyAgeIndex,
+      ...ageMeta,
+      label: manualEntry ? "manuelt registrert" : historyAgeLabel(ageMeta),
+      manual: manualEntry,
       hero: entryHero,
       board: entryBoard,
       hits: hitRanks,
@@ -1194,74 +1625,101 @@ function renderHeroHistoryMatches(opts = {}) {
       hand_id: entry.hand_id || "",
       site_hand_id: entry.site_hand_id || "",
       session_id: entry.session_id || "",
+      derivedBoardCache: derivedWithoutOrder,
       overall_index: entry.overall_index
     });
   });
     return rows;
   };
 
-  sameHeroHands.push(...collectSameHeroRows(list, true));
-  const usingAllSessionsForStats = Boolean(activeSessionId && backendCardHistory.length);
-
+  sameHeroHands.push(...collectSameHeroRows(list, true, "all-boards"));
+  const rankStats = buildHeroBoardRankStats(heroCards, list);
+  sameHeroWithBoardCount = rankStats.boardRows;
+  const boardHitRows = sameHeroHands.map(row => {
+    return {
+      ...row,
+      hitRanks: row.hits || []
+    };
+  });
   const madeHandStats = {};
+  const madeHandSeen = {};
   const addMadeHandStat = (name, row, suffix = "") => {
     if (!name) return;
     if (!madeHandStats[name]) {
       madeHandStats[name] = { name, count: 0, matches: [] };
     }
+    const uniqueKey = [
+      name,
+      row.hand_id || "",
+      row.site_hand_id || "",
+      heroCards.join("|"),
+      row.board.join("|")
+    ].join("::");
+    if (madeHandSeen[uniqueKey]) return;
+    madeHandSeen[uniqueKey] = true;
     madeHandStats[name].count += 1;
     madeHandStats[name].matches.push({
       index: row.index,
       historyIndex: row.historyIndex,
-      hero: row.hero,
+      roundAgeIndex: row.roundAgeIndex,
+      overallHistoryIndex: row.overallHistoryIndex,
+      derivedBoardCache: row.derivedBoardCache,
+      manual: row.manual,
+      hero: heroCards,
       board: row.board,
       hand_id: row.hand_id,
       site_hand_id: row.site_hand_id,
       suffix
     });
   };
-  sameHeroHands.forEach(row => {
-    const klass = String(row.showdown_class || "").trim();
-    if (klass) addMadeHandStat(klass, row);
-    (row.made_hand_signals || []).forEach(signal => {
-      if (signal.name === klass) return;
-      addMadeHandStat(signal.name, row, signal.rank ? ` ${signal.rank}` : "");
-    });
+  backendBoardHands.forEach((entry, historyIndex) => {
+    const board = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+    const made = bestMadeHandForHeroBoard(heroCards, board);
+    if (!made) return;
+    const entryOverallIndex = validHistoryIndex(entry.history_order_index ?? entry.overall_index);
+    const historyAgeIndex = entryOverallIndex !== null ? entryOverallIndex : historyIndex;
+    addMadeHandStat(made.name, {
+      index: historyAgeIndex,
+      historyIndex: historyAgeIndex,
+      roundAgeIndex: historyAgeIndex,
+      overallHistoryIndex: historyAgeIndex,
+      manual: String(entry.site_hand_id || "").startsWith("manual-") || String(entry.source || "").includes("manual"),
+      hero: heroCards,
+      board,
+      hand_id: entry.hand_id || "",
+      site_hand_id: entry.site_hand_id || "",
+      source: entry.source || "database"
+    }, made.suffix || "");
   });
 
-  const anyHitSummary = sameHeroHitSummary(anyHitMatches);
-  const comboSummary = sameHeroHitSummary(comboMatches);
-
+  const exactSingleHitMatches = rankStats.singleHits;
+  const exactComboMatches = rankStats.comboHits;
   const rankRows = heroRanks.map(rank => {
-    const stats = rankStats[rank];
-    const summary = sameHeroBoardSummary(stats.details);
+    const details = rankStats.rankMatches[rank] || [];
       return {
         type: `${rank} treff board`,
-        value: `${rank}: ${stats.matches} treff / ${stats.attempts} lagrede boards med ${rank}`,
-        count: stats.matches,
-        latest: summary.latest,
-        since: summary.recent,
-        tone: stats.matches ? "#eff6ff" : "#fff"
+        count: details.length,
+        latest: latestBoardHitLabel(details),
+        latestBoard: latestBoardSourceLabel(details, { showHero: true }),
+        tone: details.length ? "#eff6ff" : "#fff"
       };
     });
   const rows = heroRanks.length === 1
     ? rankRows
     : [
       {
-        type: "Minst ett treff",
-        value: heroRanks.join(" / "),
-        count: anyHitIndexes.length,
-        latest: anyHitSummary.latest,
-        since: anyHitSummary.recent,
-        tone: anyHitIndexes.length ? "#fff7ed" : "#fff"
+        type: "Ett treff",
+        count: exactSingleHitMatches.length,
+        latest: latestBoardHitLabel(exactSingleHitMatches),
+        latestBoard: latestBoardSourceLabel(exactSingleHitMatches, { showHero: true }),
+        tone: exactSingleHitMatches.length ? "#fff7ed" : "#fff"
       },
       {
         type: "Begge treff",
-        value: heroRanks.join(" + "),
-        count: comboIndexes.length,
-        latest: comboSummary.latest,
-        since: comboSummary.recent,
-        tone: comboIndexes.length ? "#ecfdf5" : "#fff"
+        count: exactComboMatches.length,
+        latest: latestBoardHitLabel(exactComboMatches),
+        latestBoard: latestBoardSourceLabel(exactComboMatches, { showHero: true }),
+        tone: exactComboMatches.length ? "#ecfdf5" : "#fff"
       },
       ...rankRows
     ];
@@ -1269,114 +1727,52 @@ function renderHeroHistoryMatches(opts = {}) {
   const tableRows = rows.map(row => `
     <tr style="background:${row.tone};">
       <td style="border-top:1px solid #e5e7eb; padding:7px 8px; opacity:.75;">${escapeHtml(row.type)}</td>
-      <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:800; font-size:13px;">${escapeHtml(row.value)}</td>
       <td style="border-top:1px solid #e5e7eb; padding:7px 8px; text-align:center; font-weight:800;">${row.count}</td>
       <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:700;">${escapeHtml(row.latest)}</td>
-      <td style="border-top:1px solid #e5e7eb; padding:7px 8px; line-height:1.35;">${escapeHtml(row.since)}</td>
+      <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-size:11px; opacity:.75;">${escapeHtml(row.latestBoard || "-")}</td>
     </tr>
   `).join("");
 
   const madeHandRows = MADE_HAND_ORDER
     .map(name => madeHandStats[name] || { name, count: 0, matches: [] })
     .map(stat => {
-      const summary = sameHeroHitSummary(stat.matches.map(item => ({
+      const matches = stat.matches.map(item => ({
         hit: `${madeHandLabel(stat.name)}${item.suffix || ""}`,
-        historyIndex: item.historyIndex
-      })));
+        historyIndex: item.historyIndex,
+        roundAgeIndex: item.roundAgeIndex,
+        overallHistoryIndex: item.overallHistoryIndex,
+        derivedBoardCache: item.derivedBoardCache,
+        manual: item.manual,
+        hero: item.hero,
+        board: item.board,
+        hand_id: item.hand_id,
+        site_hand_id: item.site_hand_id
+      }));
+      const count = stat.count;
       return `
         <tr style="background:${madeHandTone(stat.name, stat.count)};">
-          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:800;">${escapeHtml(madeHandLabel(stat.name))}</td>
-          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; text-align:center; font-weight:800;">${stat.count}</td>
-          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:700;">${escapeHtml(summary.latest)}</td>
-          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; line-height:1.35;">${escapeHtml(summary.recent)}</td>
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:800;">${escapeHtml(madeHandLabel(stat.name))}<div style="font-size:10px; opacity:.55; font-weight:400;">nåværende hero + lagret board</div></td>
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; text-align:center; font-weight:800;">${count}</td>
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:700;">${escapeHtml(latestBoardHitLabel(matches))}</td>
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-size:11px; opacity:.75;">${escapeHtml(latestBoardSourceLabel(matches, { showHero: false }))}</td>
         </tr>
       `;
     }).join("");
 
   const madeHandTable = `
-    <div style="margin-top:10px; font-weight:800;">Håndtype med samme hero-ranker</div>
-    <div style="margin-top:2px; opacity:.6; font-size:11px;">Viser alle ferdige håndtyper for historiske runder med 5 boardkort. 0 betyr at den håndtypen ikke er funnet ennå.</div>
+    <div style="margin-top:10px; font-weight:800;">Håndtype med nåværende hero</div>
+    <div style="margin-top:2px; opacity:.6; font-size:11px;">Teller hva dine nåværende hero-kort ville blitt sammen med hvert lagrede board.</div>
     <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff; border:1px solid #e5e7eb; margin-top:5px;">
       <thead>
         <tr style="background:#f3f4f6;">
           <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Håndtype</th>
           <th style="text-align:center; padding:7px 8px; border-bottom:1px solid #d1d5db;">Antall</th>
-          <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Sist sett</th>
-          <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Siste</th>
+          <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Sist treff</th>
+          <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Siste board</th>
         </tr>
       </thead>
       <tbody>${madeHandRows}</tbody>
     </table>
-  `;
-
-  const historyRows = sameHeroHands.slice(0, 12).map(row => {
-    const hitText = row.hits.length ? row.hits.join(" + ") : "Ingen treff";
-    const madeLabels = [];
-    if (row.showdown_class) madeLabels.push(madeHandLabel(row.showdown_class));
-    (row.made_hand_signals || []).forEach(signal => {
-      const label = signal.rank ? `${madeHandLabel(signal.name)} ${signal.rank}` : madeHandLabel(signal.name);
-      if (!madeLabels.includes(label)) madeLabels.push(label);
-    });
-    const madeText = madeLabels.length ? ` | ${madeLabels.join(" / ")}` : "";
-    const tone = row.hits.length === 2 ? "#ecfdf5" : row.hits.length ? "#eff6ff" : "#fff";
-    const idText = [
-      row.hand_id ? `backend #${row.hand_id}` : row.source,
-      row.site_hand_id ? `BetSolid ${row.site_hand_id}` : ""
-    ].filter(Boolean).join(" / ");
-    return `
-      <tr style="background:${tone};">
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:700;">${escapeHtml(row.label)}</td>
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:800;">${escapeHtml(row.hero.join(" "))}</td>
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px;">${escapeHtml(row.board.join(" "))}</td>
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:800;">${escapeHtml(hitText + madeText)}</td>
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; opacity:.65;">${escapeHtml(idText)}</td>
-      </tr>
-    `;
-  }).join("");
-  const olderHistoryRows = olderSameHeroHands.slice(0, 8).map(row => {
-    const hitText = row.hits.length ? row.hits.join(" + ") : "Ingen treff";
-    const tone = row.hits.length === 2 ? "#f0fdf4" : row.hits.length ? "#f8fafc" : "#fff";
-    const idText = [
-      row.hand_id ? `backend #${row.hand_id}` : row.source,
-      row.site_hand_id ? `BetSolid ${row.site_hand_id}` : "",
-      row.session_id ? `session ${row.session_id}` : ""
-    ].filter(Boolean).join(" / ");
-    return `
-      <tr style="background:${tone}; opacity:.82;">
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:700;">eldre ${escapeHtml(row.label)}</td>
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:800;">${escapeHtml(row.hero.join(" "))}</td>
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px;">${escapeHtml(row.board.join(" "))}</td>
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; font-weight:800;">${escapeHtml(hitText)}</td>
-        <td style="border-top:1px solid #e5e7eb; padding:6px 8px; opacity:.65;">${escapeHtml(idText)}</td>
-      </tr>
-    `;
-  }).join("");
-  const historyTable = (sameHeroHands.length || olderSameHeroHands.length) ? `
-    <div style="margin-top:10px; font-weight:800;">Tidligere samme hero-kort</div>
-    <div style="margin-top:2px; opacity:.6; font-size:11px;">Denne tabellen viser hender med samme hero-ranker, sortert nyest først. "3. nyeste" betyr tredje nyeste hånd i dette utvalget, ikke tredje siste runde totalt.</div>
-    <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff; border:1px solid #e5e7eb; margin-top:5px;">
-      <thead>
-        <tr style="background:#f3f4f6;">
-          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Rekkefølge</th>
-          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Hero</th>
-          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Board</th>
-          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Match</th>
-          <th style="text-align:left; padding:6px 8px; border-bottom:1px solid #d1d5db;">Hand-id</th>
-        </tr>
-      </thead>
-      <tbody>${historyRows}${olderHistoryRows}</tbody>
-    </table>
-    <div style="margin-top:5px; opacity:.6; font-size:11px;">Viser ${Math.min(12, sameHeroHands.length)} av ${sameHeroHands.length} lagrede runder med samme hero-kort${olderSameHeroHands.length ? `, pluss ${Math.min(8, olderSameHeroHands.length)} eldre rader fra andre sessions som ikke telles i tallene over` : ""}.</div>
-  ` : `
-    <div style="margin-top:10px; opacity:.65;">Ingen tidligere runder funnet der du hadde denne hero-rank-kombinasjonen ennå.</div>
-  `;
-
-  const statCard = (label, value, sub, color) => `
-    <div style="border:1px solid #e5e7eb; background:#fff; padding:8px; border-radius:6px; min-width:120px; flex:1;">
-      <div style="font-size:11px; opacity:.65; margin-bottom:3px;">${escapeHtml(label)}</div>
-      <div style="font-size:18px; font-weight:800; color:${color};">${escapeHtml(value)}</div>
-      <div style="font-size:11px; opacity:.65; margin-top:3px;">${escapeHtml(sub)}</div>
-    </div>
   `;
 
   box.innerHTML = `
@@ -1384,166 +1780,68 @@ function renderHeroHistoryMatches(opts = {}) {
       <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:8px;">
         <div>
           <div style="font-weight:800; margin-bottom:2px;">Hero-ranker mot board</div>
-          <div style="font-size:10px; opacity:.45; margin-bottom:2px;">visning: hero-board-read-timeout-20260620a</div>
-          <div style="font-size:11px; opacity:.65;">${escapeHtml(heroCards.join(" "))} sjekket mot ${sameHeroWithBoardCount} lagrede runder totalt${activeSessionId && usingAllSessionsForStats ? ` (aktiv session ${escapeHtml(activeSessionId)}, men historikken teller alle sessions)` : ""} med samme hero-ranker og lagret board. Hero-kort-radene teller rank-treff innenfor samme hero-ranker, uansett suit${backendCardHistory.length ? ` (${backendCardHistory.length} fra database, ${allBoardCount} totale med boardkort etter filter)` : ""}.</div>
-          <div style="font-size:11px; opacity:.55; margin-top:2px;">Samme hero-ranker finnes i ${sameHeroWithBoardCount} lagrede runder.</div>
-          <div style="font-size:11px; opacity:.55; margin-top:2px;">Historikkilde: ${backendCardHistory.length ? "database" : backendCardHistoryInFlight ? "laster database..." : "lokal nettleserhistorikk"}</div>
+          <div style="font-size:10px; opacity:.45; margin-bottom:2px;">visning: file-history-all-db-registered-hero-pairlock-20260707f</div>
+          <div style="font-size:11px; opacity:.65;">${escapeHtml(heroCards.join(" "))} sjekket mot ${sameHeroWithBoardCount} lagrede boards totalt. Radene teller bare lagrede hender der lagret hero hadde ranken og samme rank kom på lagret board.</div>
+          <div style="font-size:11px; opacity:.55; margin-top:2px;">Lagrede boards brukt i match: ${sameHeroWithBoardCount}.</div>
+          ${historyNotice ? `<div style="font-size:12px; color:#b45309; margin-top:6px; font-weight:700;">${escapeHtml(historyNotice)}</div>` : ""}
+          ${storedHeroHands && !storedBoardHands ? `<div style="font-size:12px; color:#b45309; margin-top:6px; font-weight:700;">Du har ${storedHeroHands} hero-hender lagret, men ingen boardkort på dem. Registrer board for at match-historikken skal få treff.</div>` : ""}
+          <div style="font-size:11px; opacity:.55; margin-top:2px;">Historikkilde: ${escapeHtml(matchSourceLabel)}</div>
         </div>
-      </div>
-      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; border:1px solid #e5e7eb; background:#fff; padding:8px; border-radius:6px; margin-bottom:8px;">
-        <div style="font-size:11px; opacity:.65;">Nåværende board</div>
-        <div style="font-weight:800;">${escapeHtml(currentBoardCards.join(" ") || "-")}</div>
-        <div style="font-weight:800; color:${currentHits.some(item => item.hit) ? "#15803d" : "#666"};">${escapeHtml(currentHitText)}</div>
-      </div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
-        ${heroRanks.length === 1 ? "" : statCard("Minst ett treff", String(anyHitIndexes.length), anyHitSummary.latest, anyHitIndexes.length ? "#c2410c" : "#666")}
-        ${heroRanks.length === 1 ? "" : statCard("Begge treff board", String(comboIndexes.length), comboSummary.latest, comboIndexes.length ? "#15803d" : "#666")}
-        ${heroRanks.map(rank => {
-          const stats = rankStats[rank];
-          const nowHit = currentBoardRanks.has(rank) ? "matcher nå" : "matcher ikke nå";
-          return statCard(`${rank} hero->board`, String(stats.matches), `${nowHit} | ${stats.attempts} lagrede boards med ${rank}`, stats.matches ? "#1d4ed8" : "#666");
-        }).join("")}
       </div>
       <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff; border:1px solid #e5e7eb;">
         <thead>
           <tr style="background:#f3f4f6;">
             <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Type</th>
-            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Kort</th>
-            <th style="text-align:center; padding:7px 8px; border-bottom:1px solid #d1d5db;">Matcher</th>
-            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Sist sett</th>
-            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Siste matcher</th>
+            <th style="text-align:center; padding:7px 8px; border-bottom:1px solid #d1d5db;">Antall</th>
+            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Sist treff</th>
+            <th style="text-align:left; padding:7px 8px; border-bottom:1px solid #d1d5db;">Siste board</th>
           </tr>
         </thead>
         <tbody>${tableRows}</tbody>
       </table>
       ${madeHandTable}
-      ${historyTable}
-      <div style="margin-top:6px; opacity:.6; font-size:11px;">Lagres automatisk når hero og board blir registrert/beregnet. Nyeste runde først.</div>
+      <div style="margin-top:6px; opacity:.6; font-size:11px;">Matchhistorikk hentes kun fra database/filhistorikk. Nyeste runde først.</div>
     </div>
   `;
 }
 
-function addCardHistoryEntry(heroCards, boardCards, source = "local") {
-    if (!heroCards || heroCards.length !== 2) return;
-
-    const newEntry = {
-        hero: heroCards.map(convertBetSolidCard),
-        board: (boardCards || []).map(convertBetSolidCard),
-        at: Date.now(),
-        source
-    };
-
-    const list = dedupeCardHistory(loadCardHistory());
-    const newKey = cardHistoryKey(newEntry);
-    const heroOnlyKey = `${newEntry.hero.join("|")}::`;
-
-const first = list[0];
-
-const sameAsLast =
-    first &&
-    Array.isArray(first.hero) &&
-    cardHistoryKey(first) === newKey;
-
-if (sameAsLast) {
-    console.log("â­ï¸ Same hole cards skipped");
-    first.at = Date.now();
-    first.source = first.source || source;
-    saveCardHistory(list);
-    if (first.board && first.board.length) saveHeroBoardMatchHistory(first.hero, first.board, first.source || source);
-    renderCardHistory();
-    renderHeroHistoryMatches();
-    return;
+function addCardHistoryEntry() {
+  return false;
 }
 
-    const existingIdx = list.findIndex(e => cardHistoryKey(e) === newKey);
-    if (existingIdx >= 0) {
-        const [existing] = list.splice(existingIdx, 1);
-        existing.board = newEntry.board;
-        existing.at = Date.now();
-        existing.source = existing.source || source;
-        list.unshift(existing);
-    } else if (newEntry.board.length) {
-        const heroOnlyIdx = list.findIndex(e => cardHistoryKey(e) === heroOnlyKey);
-        if (heroOnlyIdx >= 0) {
-            const [existing] = list.splice(heroOnlyIdx, 1);
-            existing.board = newEntry.board;
-            existing.at = Date.now();
-            existing.source = existing.source || source;
-            list.unshift(existing);
-        } else {
-            list.unshift(newEntry);
-        }
-    } else {
-        list.unshift(newEntry);
-    }
-
-    if (list.length > 200) list.length = 200;
-
-    saveCardHistory(list);
-    if (newEntry.board.length) saveHeroBoardMatchHistory(newEntry.hero, newEntry.board, source);
-    renderCardHistory();
-    renderHeroHistoryMatches();
-    scheduleStartingHandsRefresh("card-history", newKey);
-}
-
-function saveHeroBoardMatchHistory(heroCards, boardCards, source = "manual", meta = {}) {
-  const hero = (heroCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
-  const board = (boardCards || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
-  if (hero.length !== 2 || !board.length) return false;
-  if (new Set(hero.concat(board)).size !== hero.length + board.length) return false;
-  try {
-    const boardRanks = new Set(board.map(card => card[0]));
-    const heroRanks = [...new Set(hero.map(card => card[0]))];
-    const hits = heroRanks.filter(rank => boardRanks.has(rank));
-    if (!hits.length) {
-      console.log(`Hero-board match not saved from ${source}: no hero rank on board`, hero.join(" "), board.join(" "));
-      return false;
-    }
-    const entry = normalizeHeroBoardMatchEntry({
-      hero,
-      board,
-      at: Date.now(),
-      source,
-      hand_id: meta?.hand_id || "",
-      site_hand_id: meta?.site_hand_id || "",
-      session_id: meta?.session_id || "",
-      hits,
-      misses: heroRanks.filter(rank => !boardRanks.has(rank))
-    });
-    const list = dedupeHeroBoardMatchHistory(loadHeroBoardMatchHistory());
-    const key = heroBoardMatchHistoryKey(entry);
-    const existingIdx = list.findIndex(item => heroBoardMatchHistoryKey(item) === key);
-    if (existingIdx >= 0) list.splice(existingIdx, 1);
-    list.unshift(entry);
-    if (list.length > 500) list.length = 500;
-    saveHeroBoardMatchHistoryList(list);
-    console.log(`Saved hero-board rank match history from ${source}:`, hero.join(" "), board.join(" "), "hits:", entry.hits.join(" ") || "-");
-    return true;
-  } catch (e) {
-    console.warn("Could not save hero/board match history", e);
-    return false;
-  }
+function saveHeroBoardMatchHistory() {
+  return false;
 }
 
 function renderCardHistory() {
   const box = $("cardHistoryBox");
   if (!box) return;
-  if (!backendCardHistory.length && !backendCardHistoryInFlight) {
-    refreshBackendCardHistory({ force: true, limit: 80, timeoutMs: 4000 }).catch(console.warn);
+  const canRetryBackendHistory = !backendCardHistoryError || (Date.now() - backendCardHistoryLastAttemptAt > 15000);
+  if (!backendCardHistory.length && !backendCardHistoryInFlight && canRetryBackendHistory) {
+    refreshBackendCardHistory({ force: true, limit: 100, timeoutMs: 15000, render: true }).catch(console.warn);
   }
   if (backendCardHistoryInFlight && !backendCardHistory.length) {
-    box.innerHTML = `<div style="opacity:.7; font-style:italic;">Laster kort historikk fra backend...</div>`;
-    return;
+    const elapsed = backendCardHistoryStartedAt ? Date.now() - backendCardHistoryStartedAt : 0;
+    if (elapsed > 10000) {
+      backendCardHistoryInFlight = false;
+      backendCardHistoryStartedAt = 0;
+      backendCardHistoryError = "timeout";
+    } else {
+      const seconds = Math.max(1, Math.ceil(elapsed / 1000));
+      box.innerHTML = `<div style="opacity:.7; font-style:italic;">Laster kort historikk fra backend... ${seconds}s</div>`;
+      return;
+    }
   }
-  const usingBackendHistory = backendCardHistory.length > 0;
-  const list = usingBackendHistory
-    ? backendCardHistory
-    : dedupeCardHistory(loadCardHistory()).filter(e => !["screen-live", "hand-viewer"].includes(String(e?.source || "")));
-  if (!usingBackendHistory) saveCardHistory(list);
+  const list = sortCardHistoryNewestFirst(dedupeCardHistory(backendCardHistory))
+    .map((entry, index) => ({
+      ...entry,
+      history_order_index: index,
+      overall_index: index
+    }));
   if (!list.length) {
     box.innerHTML = `
       <div style="opacity:.7; font-style:italic;">Ingen kort historikk enna.</div>
-      <div style="margin-top:6px; font-size:12px; opacity:.6;">${backendCardHistoryError ? `Backend-historikk: ${escapeHtml(backendCardHistoryError)}.` : "Historikken oppdateres fra importerte/lagrede hender, ikke live equity."}</div>
+      <div style="margin-top:6px; font-size:12px; opacity:.6;">${backendCardHistoryError ? `Filhistorikk: ${escapeHtml(backendCardHistoryError)}.` : "Historikken hentes kun fra database/filhistorikk."}</div>
     `;
     renderHeroHistoryMatches();
     return;
@@ -1573,16 +1871,12 @@ function renderCardHistory() {
     else offsuit++;
   }
 
-  const liveStatusText = lastLiveHeroText
-    ? `Livekort: ${lastLiveHeroText}${lastLiveBoardText ? ` / board ${lastLiveBoardText}` : ""}`
-    : lastLiveCardsStatus;
-
   // build HTML with saved history updates
   const recent = list.slice(0, 12).map((e, idx) => {
     const d = new Date(e.at);
     const time = d.toLocaleTimeString();
     const boardTxt = (e.board && e.board.length) ? ` | board: <span style="color:#666;">${e.board.join(" ")}</span>` : "";
-    const rowStyle = idx === 0 && !usingBackendHistory ? ' style="background:#e8f5e9; padding:4px; margin:0 -4px; border-radius:3px;"' : '';
+    const rowStyle = idx === 0 ? ' style="background:#e8f5e9; padding:4px; margin:0 -4px; border-radius:3px;"' : '';
     return `<div${rowStyle} style="margin-bottom:4px;"><b style="color:#1976D2;">${e.hero.join(" ")}</b>${boardTxt} <span style="opacity:.5; font-size:11px; margin-left:8px;">â° ${time}</span></div>`;
   }).join("");
 
@@ -1592,26 +1886,15 @@ function renderCardHistory() {
 
   box.innerHTML = `
     <div style="margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
-      <div style="font-weight:600;">ðŸ“Š ${usingBackendHistory ? "Databasehistorikk" : "Lokal historikk"} (${list.length} totalt)</div>
-      <div style="font-size:11px; opacity:.6;">${usingBackendHistory ? "database" : "lokal historikk"} â€¢ oppdateres automatisk</div>
+      <div style="font-weight:600;">Filhistorikk (${list.length} totalt)</div>
+      <div style="font-size:11px; opacity:.6;">database/filhistorikk - oppdateres automatisk</div>
     </div>
-    <div style="margin-bottom:8px; font-size:12px; font-weight:700; color:${lastLiveHeroText ? "#15803d" : "#b45309"};">${renderLiveStatusWithCapture(liveStatusText)}</div>
     <div style="margin-bottom:10px; background:#fafafa; padding:8px; border-radius:4px; max-height:120px; overflow-y:auto; border-left:3px solid #1976D2;">${recent}</div>
     <div style="margin-top:8px; font-size:12px; opacity:.9;"><strong>Kort:</strong> ${cardLines}</div>
     <div style="margin-top:4px; font-size:12px; opacity:.85;"><strong>Rank:</strong> ${rankLines}</div>
     <div style="margin-top:4px; font-size:12px; opacity:.85;"><strong>Suit:</strong> ${suitLines}</div>
     <div style="margin-top:6px; font-size:12px; opacity:.8;"><strong>Typer:</strong> <span style="color:#4CAF50;">pairs</span>:${pairs} <span style="color:#2196F3;">suited</span>:${suited} <span style="color:#FF9800;">offsuit</span>:${offsuit}</div>
-    <div style="margin-top:10px;"><button id="cardHistoryClear" style="padding:4px 10px; background:#f44336; color:white; border:none; border-radius:4px; cursor:pointer; font-size:12px;">ðŸ—‘ï¸ TÃ¸m historikk</button></div>
   `;
-
-  const btn = $("cardHistoryClear");
-  if (btn) btn.addEventListener("click", () => {
-    if (!confirm("Slett all kort-historikk?")) return;
-    saveCardHistory([]);
-    saveHeroBoardMatchHistoryList([]);
-    renderCardHistory();
-    renderHeroHistoryMatches();
-  });
   const copyCaptureBtn = $("copyLiveCapture");
   if (copyCaptureBtn) copyCaptureBtn.addEventListener("click", async () => {
     const capture = copyCaptureBtn.dataset.capture || "";
@@ -1654,9 +1937,9 @@ function handleCardInput() {
 
 async function runEquityCalculation(opts = { auto: false }) {
   console.log(`ðŸŽ² runEquityCalculation called, opts:`, opts);
-  const heroText = normalizeSpaces(opts.heroText ?? $("hero")?.value);
-  const fallbackBoardText = cardsToText(liveBoardFallbackCards());
-  const boardText = normalizeSpaces((opts.boardText ?? $("board")?.value) || fallbackBoardText);
+  const heroText = normalizeSpaces((opts.heroText ?? $("hero")?.value) || lastLiveHeroText);
+  const fallbackBoardText = opts.live ? "" : cardsToText(liveBoardFallbackCards());
+  const boardText = normalizeSpaces((opts.boardText ?? (opts.live ? "" : $("board")?.value)) || fallbackBoardText);
   const villains = Number($("numVillains")?.value || 1);
   const rangesText = normalizeSpaces($("villains")?.value || "");
   console.log(`  heroText="${heroText}", boardText="${boardText}", villains=${villains}`);
@@ -1836,7 +2119,7 @@ function scheduleAutoEquity(opts = {}) {
   if (typeof renderManualCardPicker === "function") renderManualCardPicker();
   const auto = $("autoEquity");
   const autoStatus = $("autoEquityStatus");
-  if (manualLiveMode && !opts.manual) {
+  if (manualLiveMode && !opts.manual && !opts.live) {
     if (autoStatus) autoStatus.innerText = "Manuell laas: setup styres av deg.";
     return;
   }
@@ -1844,10 +2127,17 @@ function scheduleAutoEquity(opts = {}) {
     if (autoStatus) autoStatus.innerText = "Manuell: sla pa auto";
     return;
   }
-  if (autoStatus) autoStatus.innerText = "Manuell: venter...";
+  if (autoStatus) autoStatus.innerText = opts.live ? "Live: venter..." : "Manuell: venter...";
   if (equityTimer) clearTimeout(equityTimer);
   equityTimer = setTimeout(() => {
-    runEquityCalculation({ auto: true, manual: true, live: true, saveHistory: false }).catch(console.error);
+    runEquityCalculation({
+      auto: true,
+      manual: !opts.live,
+      live: Boolean(opts.live),
+      heroText: opts.heroText,
+      boardText: opts.boardText,
+      saveHistory: false
+    }).catch(console.error);
   }, 450);
 }
 
@@ -1871,7 +2161,7 @@ async function runHandProbabilities() {
     return;
   }
 
-  const history = dedupeCardHistory(loadCardHistory()).slice(0, 500);
+  const history = combinedCardHistory().slice(0, 500);
   out.innerText = `Beregner håndsjanser (${history.length} historikk-hender)...`;
 
   try {
@@ -1945,6 +2235,14 @@ function cardsToText(cards) {
   return (cards || []).join(" ");
 }
 
+function setCardInputValue(id, value) {
+  const el = $(id);
+  if (!el) return;
+  el.value = value;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 function selectedManualCards() {
   return {
     hero: manualPickerHeroCards.slice(),
@@ -1962,6 +2260,7 @@ function setManualCards(heroCards, boardCards) {
   activateManualCardMode();
   manualPickerHeroCards = (heroCards || []).slice();
   manualPickerBoardCards = (boardCards || []).slice();
+  lastManualHeroText = cardsToText(manualPickerHeroCards);
   const heroEl = $("hero");
   const boardEl = $("board");
   if (heroEl) heroEl.value = cardsToText(manualPickerHeroCards);
@@ -2021,6 +2320,7 @@ function clearManualCards() {
   manualPickerHeroCards = [];
   manualPickerBoardCards = [];
   manualLiveMode = false;
+  lastManualHeroText = "";
   lastManualBoardText = "";
   const heroEl = $("hero");
   const boardEl = $("board");
@@ -2198,23 +2498,17 @@ function registerHeroCards(heroCards, source = "Hero registrert.") {
   if (boardCards.length) manualPickerBoardCards = boardCards.slice();
   manualPickerTarget = manualPickerHeroCards.length < 2 ? "hero" : "board";
 
-  const heroEl = $("hero");
-  if (heroEl) heroEl.value = cardsToText(normalizedHero);
-  const input = $("heroRegisterInput");
-  if (input) input.value = cardsToText(normalizedHero);
+  const heroText = cardsToText(normalizedHero);
+  lastManualHeroText = heroText;
+  setCardInputValue("hero", heroText);
+  setCardInputValue("heroRegisterInput", heroText);
   heroCorrectionCards = [];
   renderHeroCorrection();
 
   renderManualCardPicker();
-  addCardHistoryEntry(normalizedHero, [], "hero-register");
   renderHeroHistoryMatches();
   scheduleAutoEquity({ manual: true });
   setHeroRegisterStatus(source);
-  saveLiveCardsToCurrentHand(normalizedHero, [], { source: "manual-hero-register" })
-    .then(saved => {
-      if (saved) setHeroRegisterStatus(`${source} Lagret på hand.`);
-    })
-    .catch(e => console.warn("Could not save registered hero", e));
   return true;
 }
 
@@ -2356,6 +2650,40 @@ function sendHeroToProfileEquity() {
   calculateProfileEquity().catch(console.warn);
   $("ppHeroCards")?.scrollIntoView({ behavior: "smooth", block: "center" });
   return true;
+}
+
+async function useLiveHeroForMainEquity() {
+  try {
+    setHeroRegisterStatus("Henter live hero...");
+    const res = await fetch(`${apiBase()}/live-cards?ts=${Date.now()}`);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    const heroCards = parseCards(data.hero_cards || data.hero || "").filter(isCard).slice(0, 2);
+    if (heroCards.length !== 2) {
+      setHeroRegisterStatus("Fant ikke 2 live hero-kort.");
+      return false;
+    }
+    return registerHeroCards(heroCards, "Live hero registrert.");
+  } catch (e) {
+    console.warn("Could not fetch live hero", e);
+    setHeroRegisterStatus("Klarte ikke hente live hero.");
+    return false;
+  }
+}
+
+function sendManualPickerToHeroRegister() {
+  const { hero } = selectedManualCards();
+  const heroCards = hero.map(convertBetSolidCard).filter(isCard).slice(0, 2);
+  const status = $("manualCardPickerStatus");
+
+  if (heroCards.length !== 2 || !heroCards.every(isCard)) {
+    if (status) status.innerText = "Velg 2 manuelle hero-kort før sending.";
+    return false;
+  }
+
+  const sent = registerHeroCards(heroCards, "Manuell hero registrert fra kortvelger.");
+  if (sent && status) status.innerText = "Manuell hero sendt til Hero-register.";
+  return sent;
 }
 
 function setBoardRegisterStatus(text) {
@@ -2517,17 +2845,9 @@ function registerBoardCards(boardCards, source = "Board registrert.") {
   renderBoardCorrection();
 
   renderManualCardPicker();
-  const historySaved = saveHeroBoardMatchHistory(heroCards, normalizedBoard, "board-register");
   renderHeroHistoryMatches();
   scheduleAutoEquity({ manual: true });
-  setBoardRegisterStatus(historySaved ? `${source} Match lagret.` : source);
-  if (heroCards.length === 2) {
-    saveLiveCardsToCurrentHand(heroCards, normalizedBoard, { source: "manual-board-register" })
-      .then(saved => {
-        if (saved) setBoardRegisterStatus(`${source} Lagret på hand.`);
-      })
-      .catch(e => console.warn("Could not save registered board", e));
-  }
+  setBoardRegisterStatus(`${source} Historikkmatch hentes kun fra fil/database.`);
   return true;
 }
 
@@ -2679,6 +2999,10 @@ function sendBoardToProfileEquity() {
   if ($("ppHeroCards") && $("hero")?.value && !normalizeSpaces($("ppHeroCards").value)) {
     $("ppHeroCards").value = normalizeSpaces($("hero").value);
   }
+  const heroCards = parseCards($("hero")?.value || $("heroRegisterInput")?.value || $("ppHeroCards")?.value || "").filter(isCard).slice(0, 2);
+  if (heroCards.length === 2 && new Set(heroCards.concat(boardCards)).size === heroCards.length + boardCards.length) {
+    addCardHistoryEntry(heroCards, boardCards, "board-register");
+  }
   syncProfileEquityPickerFromInputs({ manual: true });
   lastPlayerProfileEquityKey = "";
   setBoardRegisterStatus("Board sendt til Live equity mot.");
@@ -2712,6 +3036,9 @@ function sendManualPickerToProfileEquity() {
   if ($("ppEquityAuto")) $("ppEquityAuto").checked = false;
   $("ppHeroCards").value = cardsToText(hero);
   $("ppBoardCards").value = cardsToText(board);
+  if (board.length) {
+    addCardHistoryEntry(hero, board, "board-register");
+  }
   syncProfileEquityPickerFromInputs({ manual: true });
   lastPlayerProfileEquityKey = "";
   if (status) status.innerText = "Sendt til Live equity mot.";
@@ -2750,6 +3077,7 @@ function renderManualCardPicker() {
           <button type="button" id="manualTargetBoard" title="Velg board-kort" style="width:28px; height:28px; border:1px solid ${manualPickerTarget === "board" ? "#2196F3" : "#ddd"}; background:${manualPickerTarget === "board" ? "#e3f2fd" : "#fff"}; border-radius:6px; cursor:pointer; font-weight:700;">B</button>
           <button type="button" id="manualUndoCard" title="Angre siste kort" style="width:28px; height:28px; border:1px solid #ddd; background:#fff; border-radius:6px; cursor:pointer; font-size:16px; line-height:1;">&larr;</button>
           <button type="button" id="manualClearCards" title="Tom alle kort" style="width:28px; height:28px; border:1px solid #ddd; background:#fff; border-radius:6px; cursor:pointer; font-size:16px; line-height:1;">C</button>
+          <button type="button" id="manualSendHeroRegister" title="Send hero-kortene til Hero-register" style="height:28px; border:1px solid #ddd; background:#fff; border-radius:6px; cursor:pointer; font-size:12px; white-space:nowrap;">Send til hero</button>
           <button type="button" id="manualSendLiveMot" title="Send disse kortene til Live equity mot" style="height:28px; border:1px solid #ddd; background:#fff; border-radius:6px; cursor:pointer; font-size:12px; white-space:nowrap;">Send til live mot</button>
         </div>
       </div>
@@ -2786,6 +3114,7 @@ function renderManualCardPicker() {
   });
   $("manualUndoCard")?.addEventListener("click", undoManualCard);
   $("manualClearCards")?.addEventListener("click", clearManualCards);
+  $("manualSendHeroRegister")?.addEventListener("click", sendManualPickerToHeroRegister);
   $("manualSendLiveMot")?.addEventListener("click", sendManualPickerToProfileEquity);
 }
 
@@ -2891,7 +3220,7 @@ function wireEquityCalculator() {
   if (!btn) return;
 
   btn.addEventListener("click", () => {
-    runEquityCalculation({ auto: false, manual: true, live: true, saveHistory: true });
+    runEquityCalculation({ auto: false, manual: true, live: true, saveHistory: false });
   });
 
   $("handProbBtn")?.addEventListener("click", () => {
@@ -2909,6 +3238,9 @@ function wireEquityCalculator() {
   });
   $("heroPasteZone")?.addEventListener("click", () => {
     setHeroRegisterStatus("Trykk Ctrl+V her for tekst eller bilde fra Utklippsverktøy.");
+  });
+  $("heroUseLiveBtn")?.addEventListener("click", () => {
+    useLiveHeroForMainEquity().catch(console.warn);
   });
   $("heroSendLiveMotBtn")?.addEventListener("click", () => {
     sendHeroToProfileEquity();
@@ -2986,6 +3318,7 @@ function wireEquityCalculator() {
           const result = await res.json();
           $("importStatus").innerText = `âœ… Imported! ${result.imported_hands} hand(s)`;
           importFile.value = "";
+          await refreshBackendCardHistory({ force: true, render: true });
           // Auto-refresh polling to show new hand
           if (typeof pollCurrentGame === 'function') {
             setTimeout(pollCurrentGame, 500);
@@ -3495,19 +3828,11 @@ async function loadHand(handId, opts = { silent: false }) {
 
         if (opts.saveHistory === true) {
           try {
-            const existing = loadCardHistory();
-            const first = existing && existing.length ? existing[0] : null;
-            const sameAsLast = first && Array.isArray(first.hero) && first.hero[0] === hole.card1 && first.hero[1] === hole.card2 && JSON.stringify(first.board || []) === JSON.stringify(cardData.board || []);
-            if (!sameAsLast) {
-                addCardHistoryEntry([hole.card1, hole.card2], cardData.board || [], "hand-viewer");
-
-                const statusEl = $("hvSaveStatus");
-                if (statusEl) statusEl.innerText = "Saved";
-
-                setTimeout(() => {
-                    if ($("hvSaveStatus")) $("hvSaveStatus").innerText = "";
-                }, 1400);
-            }
+            const statusEl = $("hvSaveStatus");
+            if (statusEl) statusEl.innerText = "Filhistorikk";
+            setTimeout(() => {
+                if ($("hvSaveStatus")) $("hvSaveStatus").innerText = "";
+            }, 1400);
           } catch (e) {
             console.warn("save failed", e);
           }
@@ -4481,7 +4806,7 @@ async function saveLiveCardsToCurrentHand(heroCards, boardCards = [], meta = {})
   const source = String(meta?.source || "");
   const isScreenSource = source.includes("screen");
   const explicitHandId = meta?.hand_id || meta?.id || "";
-  const handId = explicitHandId || (!isScreenSource ? (lastGameState?.hand_id || $("hvHandId")?.value?.trim()) : "");
+  const handId = explicitHandId || lastGameState?.hand_id || $("hvHandId")?.value?.trim() || "";
   const hero = (heroCards || []).map(convertBetSolidCard).filter(isCard);
   const board = (boardCards || []).map(convertBetSolidCard).filter(isCard);
   if (hero.length !== 2) return false;
@@ -4817,7 +5142,7 @@ document.addEventListener("DOMContentLoaded", () => {
   if (autoEquityBox) autoEquityBox.checked = false;
   const autoEquityStatus = $("autoEquityStatus");
   if (autoEquityStatus) {
-    autoEquityStatus.innerText = "Kortleser aktiv: lagrer historikk. Setup/resultat styres manuelt.";
+    autoEquityStatus.innerText = "";
   }
 
   // Render any saved card history
@@ -4835,12 +5160,6 @@ document.addEventListener("DOMContentLoaded", () => {
       console.warn("cardHistory storage event failed", e);
     }
   });
-
-  // Fallback: periodic refresh in case storage events are missed (every 1s for live updates)
-  setInterval(() => {
-    try { renderCardHistory(); } catch (e) { /* ignore */ }
-    try { renderHeroHistoryMatches(); } catch (e) { /* ignore */ }
-  }, 1000);
 
   // Session Insights
   function loadSessionInsights() {
@@ -4892,87 +5211,110 @@ async function applyLiveScreenCards() {
 
     const cardsData = await cardsRes.json();
     lastLiveCardsMeta = cardsData || {};
+    const liveGameKey = String(cardsData.gamecode || cardsData.hand_id || "");
+    const liveGameChanged = Boolean(liveGameKey && lastLiveCardsGameKey && liveGameKey !== lastLiveCardsGameKey);
+    if (liveGameChanged) {
+      lastLiveHeroText = "";
+      lastLiveBoardText = "";
+      pendingScreenHeroText = "";
+      pendingScreenHeroCount = 0;
+    }
+    if (liveGameKey) lastLiveCardsGameKey = liveGameKey;
     if (Array.isArray(cardsData.players) && cardsData.players.length) {
       mergeKnownPlayerNames(cardsData.players.map(p => p.name || p.player_name));
     }
     const liveTimestamp = Number(cardsData.timestamp || 0);
     const liveAgeSeconds = liveTimestamp ? (Date.now() / 1000 - liveTimestamp) : Infinity;
-    if (liveAgeSeconds > 4) {
+    const rawHeroText = normalizeSpaces(cardsData.hero_cards || cardsData.hero || "");
+    const rawBoardText = normalizeSpaces(cardsData.board || "");
+    const liveHeroCards = parseCards(rawHeroText);
+    const liveBoardCards = parseCards(rawBoardText);
+    const heroText = liveHeroCards.join(" ");
+    const boardText = liveBoardCards.join(" ");
+    const validLiveHero = liveHeroCards.length === 2 && liveHeroCards.every(isCard);
+    const validLiveBoard = [3, 4, 5].includes(liveBoardCards.length) && liveBoardCards.every(isCard);
+    const hasUsableCards = validLiveHero || (Boolean(boardText) && validLiveBoard);
+    const source = String(cardsData.source || "");
+    const isScreenSource = source.startsWith("screen_");
+    if (cardsData.error === "stale_live_cards" || source === "stale_live_cards") {
       lastLiveHeroText = "";
       lastLiveBoardText = "";
-      lastLiveCardsStatus = "Livekort: venter på fersk skjermlesing.";
+      lastLiveCardsStatus = "Livekort: skjermlesing er stale.";
       pendingScreenHeroText = "";
       pendingScreenHeroCount = 0;
       liveScreenActive = false;
-      renderCardHistory();
+      clearMainHeroForNewLiveHand();
+      const autoStatus = $("autoEquityStatus");
+      if (autoStatus) autoStatus.innerText = "Live: venter på fersk skjermlesing.";
+      return false;
+    }
+    if (liveGameChanged && !validLiveHero) {
+      clearMainHeroForNewLiveHand();
+    }
+
+    if (liveAgeSeconds > 15 && !hasUsableCards) {
+      lastLiveHeroText = "";
+      lastLiveBoardText = "";
+      lastLiveCardsStatus = lastLiveHeroText
+        ? `Livekort: ${lastLiveHeroText}${lastLiveBoardText ? ` / board ${lastLiveBoardText}` : ""}`
+        : "Livekort: venter på fersk skjermlesing.";
+      pendingScreenHeroText = "";
+      pendingScreenHeroCount = 0;
+      liveScreenActive = false;
       return false;
     }
 
-    if (cardsData.source === "screen_error") {
+    if (isScreenSource && !hasUsableCards) {
       const autoStatus = $("autoEquityStatus");
       lastLiveHeroText = "";
       lastLiveBoardText = "";
-      lastLiveCardsStatus = `Livekort: lesefeil${cardsData.error ? ` (${cardsData.error})` : ""}`;
+      const confirmingNewRead = String(cardsData.error || "").includes("confirming_new_read");
+      lastLiveCardsStatus = confirmingNewRead
+        ? "Livekort: bekrefter nytt skjermkort."
+        : `Livekort: lesefeil${cardsData.error ? ` (${cardsData.error})` : ""}`;
       pendingScreenHeroText = "";
       pendingScreenHeroCount = 0;
       liveScreenActive = false;
-      if (autoStatus) autoStatus.innerText = "Live: venter på kort.";
-      renderCardHistory();
+      if (autoStatus) autoStatus.innerText = confirmingNewRead ? "Live: bekrefter skjermkort." : "Live: venter på kort.";
       return false;
     }
 
-    const heroText = normalizeSpaces(cardsData.hero_cards || cardsData.hero || "");
-    const boardText = normalizeSpaces(cardsData.board || "");
-    const source = String(cardsData.source || "");
-    const isScreenSource = source.startsWith("screen_");
-    const liveHeroCards = parseCards(heroText);
-    const liveBoardCards = parseCards(boardText);
-    const validLiveHero = liveHeroCards.length === 2 && liveHeroCards.every(isCard);
-    const validLiveBoard = liveBoardCards.length <= 5 && liveBoardCards.every(isCard);
+    pendingScreenHeroText = "";
+    pendingScreenHeroCount = 0;
 
-    if (isScreenSource && validLiveHero && heroText !== lastLiveHeroText) {
-      if (heroText === pendingScreenHeroText) {
-        pendingScreenHeroCount += 1;
-      } else {
-        pendingScreenHeroText = heroText;
-        pendingScreenHeroCount = 1;
-      }
-
-      if (pendingScreenHeroCount < 2) {
-        const autoStatus = $("autoEquityStatus");
-        if (autoStatus) autoStatus.innerText = `Live: bekrefter skjermkort (${heroText})`;
-        return false;
-      }
-    } else if (!isScreenSource) {
-      pendingScreenHeroText = "";
-      pendingScreenHeroCount = 0;
-    }
-
-    liveScreenActive = isScreenSource && (validLiveHero || (Boolean(boardText) && validLiveBoard));
+    liveScreenActive = hasUsableCards;
     if (validLiveHero) {
       if (heroText !== lastLiveHeroText && (!boardText || !validLiveBoard)) {
         lastLiveBoardText = "";
       }
       lastLiveHeroText = heroText;
+      lastLiveCardsSeenAt = Date.now();
       lastLiveCardsStatus = `Livekort: ${heroText}`;
-      console.log("Live screen hero cards read for history:", heroText);
+      console.log("Live screen hero cards read:", heroText);
     }
 
     if (boardText && validLiveBoard) {
       lastLiveBoardText = boardText;
+      lastLiveCardsSeenAt = Date.now();
       lastLiveCardsStatus = `Livekort: ${heroText || "-"} / board ${boardText}`;
-      console.log("Live screen board read for history:", boardText);
-    }
-
-    if (validLiveHero) {
-      const historyBoardCards = validLiveBoard && liveBoardCards.length ? liveBoardCards : [];
-      try { addCardHistoryEntry(liveHeroCards, historyBoardCards, "screen-live"); } catch(e) { console.warn(e); }
-      saveLiveCardsToCurrentHand(liveHeroCards, historyBoardCards, cardsData).catch(console.warn);
+      console.log("Live screen board read:", boardText);
     }
 
     if (validLiveHero || (Boolean(boardText) && validLiveBoard)) {
       const autoStatus = $("autoEquityStatus");
-      if (autoStatus) autoStatus.innerText = "Kortleser aktiv: lagrer historikk. Setup/resultat styres manuelt.";
+      if (autoStatus) {
+        const liveParts = [];
+        if (lastLiveHeroText) liveParts.push(lastLiveHeroText);
+        if (lastLiveBoardText) liveParts.push(`board ${lastLiveBoardText}`);
+        autoStatus.innerText = liveParts.length ? `Livekort: ${liveParts.join(" / ")}` : "Live: venter på kort.";
+      }
+      if (validLiveHero) {
+        scheduleAutoEquity({
+          live: true,
+          heroText,
+          boardText: validLiveBoard ? boardText : undefined
+        });
+      }
     }
 
     return validLiveHero || (Boolean(boardText) && validLiveBoard);
@@ -4982,7 +5324,6 @@ async function applyLiveScreenCards() {
     lastLiveBoardText = "";
     lastLiveCardsStatus = "Livekort: kunne ikke hente skjermlesing.";
     liveScreenActive = false;
-    renderCardHistory();
     return false;
   }
 }
@@ -5020,6 +5361,13 @@ console.timeEnd("latest-with-stats");
       
       const data = await res.json();
       console.log("ðŸ“¡ got adaptive stats:", data);
+      lastGameState = {
+        hero: lastGameState.hero || "",
+        board: data.board || lastGameState.board || "",
+        hand_id: data.hand_id || lastGameState.hand_id || "",
+        session_id: data.session_id || lastGameState.session_id || "",
+        session_code: data.session_code || lastGameState.session_code || ""
+      };
       if (data?.session_id) syncActiveSessionFields(data.session_id, "poll");
       await applyLiveScreenCards();
 
@@ -5102,19 +5450,13 @@ if (data.hand_id && data.hand_id !== previousHandId) {
 
 lastGameState = {
   hero: lastGameState.hero || "",
-  board: data.board || "",
+  board: data.board || lastGameState.board || "",
   hand_id: data.hand_id || "",
-  session_id: data.session_id || ""
+  session_id: data.session_id || "",
+  session_code: data.session_code || lastGameState.session_code || ""
 };
 
 await applyLiveScreenCards();
-if (lastLiveHeroText) {
-  const heroCards = parseCards(lastLiveHeroText);
-  const boardCards = parseCards(lastLiveBoardText || "").filter(isCard).slice(0, 5);
-  if (heroCards.length === 2 && heroCards.every(isCard)) {
-    await saveLiveCardsToCurrentHand(heroCards, boardCards.every(isCard) ? boardCards : [], lastLiveCardsMeta);
-  }
-}
 
 } catch (err) {
   console.warn("âš ï¸ pollCurrentGame error:", err.message);
@@ -5126,6 +5468,7 @@ if (lastLiveHeroText) {
   function startLiveGamePolling() {
     manualLiveMode = false;
     liveScreenActive = false;
+    lastLiveCardsStatus = "Livekort: venter på kort.";
     // Stopp eventuelle eksisterande polling
     if (currentGamePoller) {
       clearInterval(currentGamePoller);
@@ -5134,7 +5477,7 @@ if (lastLiveHeroText) {
     console.log(`Starting live polling...`);
     
     const autoStatus = $("autoEquityStatus");
-    if (autoStatus) autoStatus.innerText = "Kortleser aktiv: lagrer historikk. Setup/resultat styres manuelt.";
+    if (autoStatus) autoStatus.innerText = "Live: venter på kort.";
     
 
 // Bruk setInterval - det er meir reliable
@@ -5164,6 +5507,7 @@ startingHandsFallbackTimer = setInterval(() => {
   function stopLiveGamePolling() {
     manualLiveMode = false;
     liveScreenActive = false;
+    lastLiveCardsStatus = "Livekort: polling av.";
     if (currentGamePoller) {
       clearInterval(currentGamePoller);
       currentGamePoller = null;
@@ -5192,7 +5536,7 @@ startingHandsFallbackTimer = setInterval(() => {
   const manualLiveHelp = manualLiveBox?.lastElementChild;
   if (manualLiveTitle) manualLiveTitle.innerText = "Live Polling";
   if (manualLiveHelp) {
-    manualLiveHelp.innerText = "Kortleseren oppdaterer historikk, livefelter, motspillere og ranges. Bruk manuelle testkort for egen equity-sjekk.";
+    manualLiveHelp.innerText = "Kortleseren kan vise livekort og motspillere når du starter den. Historikk hentes separat fra databasen.";
   }
 
   // Event listeners for live polling buttons
@@ -5212,11 +5556,10 @@ startingHandsFallbackTimer = setInterval(() => {
     stopLiveGamePolling();
   });
 
-  startLiveGamePolling();
-  if (startLiveButton) startLiveButton.style.display = "none";
-  if (stopLiveButton) stopLiveButton.style.display = "block";
+  if (startLiveButton) startLiveButton.style.display = "block";
+  if (stopLiveButton) stopLiveButton.style.display = "none";
   const liveStatus = $("liveGameStatus");
-  if (liveStatus) liveStatus.innerText = "Live polling aktiv - kortleseren leser hele tiden.";
+  if (liveStatus) liveStatus.innerText = "Ikke aktiv";
 
   $("btnSessionInsights")?.addEventListener("click", loadSessionInsights);
 
