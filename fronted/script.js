@@ -64,7 +64,7 @@ function wireLiveCaptureButtons() {
 
 function apiBase() {
   // Dashboard input if you have it; else fallback to backend
-  return $("apiBase")?.value?.trim() || "http://127.0.0.1:8000";
+  return $("apiBase")?.value?.trim() || "http://127.0.0.1:8010";
 }
 
 // Global variables for live game polling
@@ -942,7 +942,7 @@ function historyEntriesWithBoards(list) {
 
 async function refreshBackendCardHistory(opts = {}) {
   const now = Date.now();
-  const historySessionKey = "file-history-all-db-registered-hero-pairlock-20260707f";
+  const historySessionKey = "file-history-all-db-showdown-made-hand-20260709i";
   if (
     !opts.force &&
     backendCardHistoryLoadedAt &&
@@ -975,6 +975,7 @@ async function refreshBackendCardHistory(opts = {}) {
     const heroName = dashHero();
     if (heroName) params.set("player_name", heroName);
     params.set("limit", String(opts.limit || 1000));
+    params.set("include_showdown", "true");
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), opts.timeoutMs || 5000);
     let res;
@@ -1447,6 +1448,10 @@ function heroRankMadeHandSignals(heroCards, boardCards) {
   const heroRankSet = new Set(Object.keys(heroCounts));
   const tripsRanks = Object.keys(combinedCounts).filter(rank => combinedCounts[rank] >= 3);
   const pairRanks = Object.keys(combinedCounts).filter(rank => combinedCounts[rank] >= 2);
+  const quadAnyRank = Object.keys(combinedCounts).find(rank => combinedCounts[rank] >= 4);
+  if (quadAnyRank) {
+    signals.push({ name: "Four of a Kind", rank: quadAnyRank });
+  }
   const fullHouseRank = tripsRanks.find(tripsRank =>
     pairRanks.some(pairRank => pairRank !== tripsRank) &&
     (heroRankSet.has(tripsRank) || pairRanks.some(pairRank => pairRank !== tripsRank && heroRankSet.has(pairRank)))
@@ -1454,7 +1459,6 @@ function heroRankMadeHandSignals(heroCards, boardCards) {
   if (fullHouseRank) {
     signals.push({ name: "Full House", rank: fullHouseRank });
   }
-
   Object.keys(heroCounts).forEach(rank => {
     const boardCount = boardCounts[rank] || 0;
     if (!boardCount) return;
@@ -1474,6 +1478,8 @@ function heroRankMadeHandSignals(heroCards, boardCards) {
     const boardHasOtherPair = Object.keys(boardCounts).some(rank => rank !== pairedRank && boardCounts[rank] >= 2);
     if (boardHasOtherPair) {
       signals.push({ name: "Two Pair", rank: pairedRank });
+    } else {
+      signals.push({ name: "Pair", rank: pairedRank });
     }
   }
   Object.keys(heroSuitCounts).forEach(suit => {
@@ -1536,7 +1542,7 @@ function renderHeroHistoryMatches(opts = {}) {
   }
 
   if (!opts.skipBackendRefresh) {
-    refreshBackendCardHistory({ limit: 100, timeoutMs: 15000, render: true }).catch(console.warn);
+    refreshBackendCardHistory({ limit: 1000, timeoutMs: 15000, render: true }).catch(console.warn);
   }
 
   const backendHistoryForMatch = sortCardHistoryNewestFirst(
@@ -1652,7 +1658,7 @@ function renderHeroHistoryMatches(opts = {}) {
       name,
       row.hand_id || "",
       row.site_hand_id || "",
-      heroCards.join("|"),
+      (row.hero || heroCards).join("|"),
       row.board.join("|")
     ].join("::");
     if (madeHandSeen[uniqueKey]) return;
@@ -1665,7 +1671,7 @@ function renderHeroHistoryMatches(opts = {}) {
       overallHistoryIndex: row.overallHistoryIndex,
       derivedBoardCache: row.derivedBoardCache,
       manual: row.manual,
-      hero: heroCards,
+      hero: row.hero || heroCards,
       board: row.board,
       hand_id: row.hand_id,
       site_hand_id: row.site_hand_id,
@@ -1673,23 +1679,33 @@ function renderHeroHistoryMatches(opts = {}) {
     });
   };
   backendBoardHands.forEach((entry, historyIndex) => {
+    const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
     const board = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
-    const made = bestMadeHandForHeroBoard(heroCards, board);
-    if (!made) return;
+    const entryHeroRanks = new Set(entryHero.map(card => card[0]));
+    const sharedRanks = heroRanks.filter(rank => entryHeroRanks.has(rank));
+    if (!sharedRanks.length) return;
     const entryOverallIndex = validHistoryIndex(entry.history_order_index ?? entry.overall_index);
     const historyAgeIndex = entryOverallIndex !== null ? entryOverallIndex : historyIndex;
-    addMadeHandStat(made.name, {
+    const showdownClass = String(entry.showdown_class || "").trim();
+    const localSignals = heroRankMadeHandSignals(entryHero, board);
+    const signalRows = showdownClass
+      ? [{ name: showdownClass, rank: "" }, ...localSignals]
+      : localSignals;
+    const madeSignals = signalRows.length
+      ? signalRows
+      : [{ name: "High Card", rank: "" }];
+    madeSignals.forEach(signal => addMadeHandStat(signal.name, {
       index: historyAgeIndex,
       historyIndex: historyAgeIndex,
       roundAgeIndex: historyAgeIndex,
       overallHistoryIndex: historyAgeIndex,
       manual: String(entry.site_hand_id || "").startsWith("manual-") || String(entry.source || "").includes("manual"),
-      hero: heroCards,
+      hero: entryHero,
       board,
       hand_id: entry.hand_id || "",
       site_hand_id: entry.site_hand_id || "",
       source: entry.source || "database"
-    }, made.suffix || "");
+    }, signal.rank ? ` ${signal.rank}` : ""));
   });
 
   const exactSingleHitMatches = rankStats.singleHits;
@@ -1751,7 +1767,7 @@ function renderHeroHistoryMatches(opts = {}) {
       const count = stat.count;
       return `
         <tr style="background:${madeHandTone(stat.name, stat.count)};">
-          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:800;">${escapeHtml(madeHandLabel(stat.name))}<div style="font-size:10px; opacity:.55; font-weight:400;">nåværende hero + lagret board</div></td>
+          <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:800;">${escapeHtml(madeHandLabel(stat.name))}<div style="font-size:10px; opacity:.55; font-weight:400;">lagret hero + board</div></td>
           <td style="border-top:1px solid #e5e7eb; padding:7px 8px; text-align:center; font-weight:800;">${count}</td>
           <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-weight:700;">${escapeHtml(latestBoardHitLabel(matches))}</td>
           <td style="border-top:1px solid #e5e7eb; padding:7px 8px; font-size:11px; opacity:.75;">${escapeHtml(latestBoardSourceLabel(matches, { showHero: false }))}</td>
@@ -1760,8 +1776,8 @@ function renderHeroHistoryMatches(opts = {}) {
     }).join("");
 
   const madeHandTable = `
-    <div style="margin-top:10px; font-weight:800;">Håndtype med nåværende hero</div>
-    <div style="margin-top:2px; opacity:.6; font-size:11px;">Teller hva dine nåværende hero-kort ville blitt sammen med hvert lagrede board.</div>
+    <div style="margin-top:10px; font-weight:800;">Håndtype i matchende historikk</div>
+    <div style="margin-top:2px; opacity:.6; font-size:11px;">Teller lagret hero + board der lagret hero hadde en av dine nåværende ranker.</div>
     <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff; border:1px solid #e5e7eb; margin-top:5px;">
       <thead>
         <tr style="background:#f3f4f6;">
@@ -1780,7 +1796,7 @@ function renderHeroHistoryMatches(opts = {}) {
       <div style="display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:8px;">
         <div>
           <div style="font-weight:800; margin-bottom:2px;">Hero-ranker mot board</div>
-          <div style="font-size:10px; opacity:.45; margin-bottom:2px;">visning: file-history-all-db-registered-hero-pairlock-20260707f</div>
+          <div style="font-size:10px; opacity:.45; margin-bottom:2px;">visning: file-history-all-db-registered-hero-rank-match-20260708b</div>
           <div style="font-size:11px; opacity:.65;">${escapeHtml(heroCards.join(" "))} sjekket mot ${sameHeroWithBoardCount} lagrede boards totalt. Radene teller bare lagrede hender der lagret hero hadde ranken og samme rank kom på lagret board.</div>
           <div style="font-size:11px; opacity:.55; margin-top:2px;">Lagrede boards brukt i match: ${sameHeroWithBoardCount}.</div>
           ${historyNotice ? `<div style="font-size:12px; color:#b45309; margin-top:6px; font-weight:700;">${escapeHtml(historyNotice)}</div>` : ""}
@@ -1818,7 +1834,7 @@ function renderCardHistory() {
   if (!box) return;
   const canRetryBackendHistory = !backendCardHistoryError || (Date.now() - backendCardHistoryLastAttemptAt > 15000);
   if (!backendCardHistory.length && !backendCardHistoryInFlight && canRetryBackendHistory) {
-    refreshBackendCardHistory({ force: true, limit: 100, timeoutMs: 15000, render: true }).catch(console.warn);
+    refreshBackendCardHistory({ force: true, limit: 1000, timeoutMs: 15000, render: true }).catch(console.warn);
   }
   if (backendCardHistoryInFlight && !backendCardHistory.length) {
     const elapsed = backendCardHistoryStartedAt ? Date.now() - backendCardHistoryStartedAt : 0;
@@ -4212,6 +4228,20 @@ function wirePlayerProfile() {
   $("ppLoad")?.addEventListener("click", loadPlayerProfile);
 }
 
+function openPlayerProfileFromTable(playerName) {
+  const name = String(playerName || "").trim();
+  if (!name) return;
+  const ppPlayer = $("ppPlayer");
+  if (ppPlayer) ppPlayer.value = name;
+  const mtPlayer = $("mtPlayer");
+  if (mtPlayer && !mtPlayer.value) mtPlayer.value = name;
+  const spPlayer = $("spPlayer");
+  if (spPlayer && !spPlayer.value) spPlayer.value = name;
+  const lhPlayer = $("lhPlayer");
+  if (lhPlayer && !lhPlayer.value) lhPlayer.value = name;
+  loadPlayerProfile().catch(console.error);
+}
+
 
 // ------------------------------
 // Villain profile cache + renderer (inline in Live Coach card)
@@ -5389,12 +5419,17 @@ console.timeEnd("latest-with-stats");
         }
         
         // ===== AUTO-FYLLE SPILLER-FELTENE MED FÃ˜RSTE SPILLER =====
-        const firstPlayer = data.players[0]?.name;
+        const heroName = String(dashHero?.() || "angryshark").trim().toLowerCase();
+        const firstPlayer = data.players
+          .map(p => String(p.name || p.player_name || "").trim())
+          .find(name => name && name.toLowerCase() !== heroName)
+          || String(data.players[0]?.name || data.players[0]?.player_name || "").trim();
         if (firstPlayer) {
           const playerFields = ["mtPlayer", "spPlayer", "ppPlayer", "lhPlayer"];
           playerFields.forEach(fieldId => {
             const field = $(fieldId);
-            if (field && !field.value) {
+            const current = String(field?.value || "").trim().toLowerCase();
+            if (field && (!current || current === heroName || current === "angryshark")) {
               field.value = firstPlayer;
               console.log(`âœ… Auto-set ${fieldId} to ${firstPlayer}`);
             }
@@ -5417,19 +5452,31 @@ console.timeEnd("latest-with-stats");
           console.log(`  ${p.name}: ${p.player_type.toUpperCase()} (VPIP=${p.vpip_pct.toFixed(1)}%, PFR=${p.pfr_pct.toFixed(1)}%) â†’ Range: ${p.suggested_range}`);
         });
         
-        // BONUS: Vis motspiller-kort i en detalj-seksjon (hvis finnes)
+        // Vis spillerne ved bordet som klikkbare motspillere.
         const playerDetailsEl = $("adaptivePlayerDetails");
         if (playerDetailsEl) {
-          let html = "<div style='font-size:11px; opacity:.8;'>";
-          data.players.forEach(p => {
+          const players = data.players
+            .map(p => ({ ...p, name: String(p.name || p.player_name || "").trim() }))
+            .filter(p => p.name);
+          let html = "<div style='font-size:11px; opacity:.9;'>";
+          html += "<div style='font-weight:700; margin-bottom:6px;'>Motspillere ved bordet</div>";
+          players.forEach(p => {
             const typeColor = { "nit": "#4CAF50", "tag": "#2196F3", "lag": "#FF9800", "fish": "#f44336", "unknown": "#999" }[p.player_type] || "#999";
-            html += `<div style='margin:4px 0; padding:4px; background:#f5f5f5; border-left:3px solid ${typeColor};'>
-              <strong>${p.name}</strong>: ${p.player_type.toUpperCase()} 
-              (VPIP=${p.vpip_pct.toFixed(1)}%, PFR=${p.pfr_pct.toFixed(1)}%, ${p.hands_played} hands)
+            const vpip = Number(p.vpip_pct || 0).toFixed(1);
+            const pfr = Number(p.pfr_pct || 0).toFixed(1);
+            html += `<div style='margin:4px 0; padding:6px; background:#fff; border:1px solid #eee; border-left:3px solid ${typeColor}; border-radius:4px;'>
+              <button type="button" class="tablePlayerProfileBtn" data-player="${escapeHtml(p.name)}" style="font-weight:700; color:#0b66c3; background:transparent; border:0; padding:0; cursor:pointer; text-decoration:underline;">
+                ${escapeHtml(p.name)}
+              </button>
+              <span style="opacity:.75;">${escapeHtml(String(p.player_type || "unknown").toUpperCase())}</span>
+              <span style="opacity:.75;">VPIP ${vpip}% / PFR ${pfr}% / ${Number(p.hands_played || 0)} hender</span>
             </div>`;
           });
           html += "</div>";
           playerDetailsEl.innerHTML = html;
+          playerDetailsEl.querySelectorAll(".tablePlayerProfileBtn").forEach(btn => {
+            btn.addEventListener("click", () => openPlayerProfileFromTable(btn.getAttribute("data-player")));
+          });
         }
       }
     

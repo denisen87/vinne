@@ -16,6 +16,7 @@ ACTION_MAP = {
     3: "call",
     4: "check",
     5: "bet",
+    15: "ante",
     23: "raise",
 }
 
@@ -25,9 +26,131 @@ def money_to_float(s: str | None) -> float:
     if not s:
         return 0.0
     s = s.strip()
-    s = MONEY_RE.sub("", s)   # fjern € osv
-    s = s.replace(",", ".")
-    return float(s) if s else 0.0
+    s = MONEY_RE.sub("", s)
+    if not s or s in {"-", ".", ","}:
+        return 0.0
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".")
+    elif s.count(".") > 1:
+        s = s.replace(".", "")
+    elif "." in s:
+        left, right = s.rsplit(".", 1)
+        if len(right) == 3 and left.replace(".", "").isdigit():
+            s = left.replace(".", "") + right
+    if not s or s in {"-", "."}:
+        return 0.0
+    try:
+        return float(s) if s else 0.0
+    except ValueError:
+        compact = re.sub(r"[^\d\-]", "", s)
+        return float(compact) if compact not in {"", "-"} else 0.0
+
+
+def import_cards_for_hand(db: DbSession, hand: Hand, game: ET.Element) -> None:
+    flop1 = flop2 = flop3 = turn = river = None
+
+    for rnd in game.findall("round"):
+        try:
+            street = int(rnd.attrib.get("no", "0"))
+        except ValueError:
+            street = 0
+
+        cards_attr = (rnd.attrib.get("cards") or "").strip()
+        if cards_attr:
+            cards = cards_attr.split()
+            if street == 1 and len(cards) >= 3:
+                flop1, flop2, flop3 = cards[0], cards[1], cards[2]
+            elif street == 2 and len(cards) >= 1:
+                turn = cards[3] if len(cards) >= 4 else cards[0]
+            elif street == 3 and len(cards) >= 1:
+                river = cards[4] if len(cards) >= 5 else cards[0]
+
+        for cards_node in rnd.findall("cards"):
+            card_type = (cards_node.attrib.get("type") or "").lower()
+            cards_text = (cards_node.text or "").strip()
+            if not cards_text:
+                continue
+
+            cards = cards_text.split()
+            if card_type == "pocket":
+                player_name = cards_node.attrib.get("player")
+                if player_name and len(cards) >= 2:
+                    existing = db.query(HoleCards).filter(
+                        HoleCards.hand_id == hand.id,
+                        HoleCards.player_name == player_name,
+                    ).first()
+                    if existing:
+                        existing.card1 = cards[0]
+                        existing.card2 = cards[1]
+                        existing.is_known = cards[0] != "X" and cards[1] != "X"
+                    else:
+                        db.add(HoleCards(
+                            hand_id=hand.id,
+                            player_name=player_name,
+                            card1=cards[0],
+                            card2=cards[1],
+                            is_known=(cards[0] != "X" and cards[1] != "X"),
+                        ))
+            elif card_type == "flop" and len(cards) >= 3:
+                flop1, flop2, flop3 = cards[0], cards[1], cards[2]
+            elif card_type == "turn" and len(cards) >= 1:
+                turn = cards[0]
+            elif card_type == "river" and len(cards) >= 1:
+                river = cards[0]
+
+    ggen = game.find("general")
+    players_node = ggen.find("players") if ggen is not None else None
+    if players_node is not None:
+        for p in players_node.findall("player"):
+            name = p.attrib.get("name")
+            cards_attr = (p.attrib.get("cards") or "").strip()
+            if not name or not cards_attr:
+                continue
+            cards = cards_attr.split()
+            if len(cards) < 2:
+                continue
+            existing = db.query(HoleCards).filter(
+                HoleCards.hand_id == hand.id,
+                HoleCards.player_name == name,
+            ).first()
+            if existing:
+                existing.card1 = cards[0]
+                existing.card2 = cards[1]
+                existing.is_known = cards[0] != "X" and cards[1] != "X"
+            else:
+                db.add(HoleCards(
+                    hand_id=hand.id,
+                    player_name=name,
+                    card1=cards[0],
+                    card2=cards[1],
+                    is_known=(cards[0] != "X" and cards[1] != "X"),
+                ))
+
+    if any([flop1, flop2, flop3, turn, river]):
+        board = db.query(Board).filter(Board.hand_id == hand.id).first()
+        if board:
+            if flop1:
+                board.flop1 = flop1
+            if flop2:
+                board.flop2 = flop2
+            if flop3:
+                board.flop3 = flop3
+            if turn:
+                board.turn = turn
+            if river:
+                board.river = river
+        else:
+            db.add(Board(hand_id=hand.id, flop1=flop1, flop2=flop2, flop3=flop3, turn=turn, river=river))
+
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
 
 
 @router.post("/betsolid", summary="Import BetSolid XML (text/plain)")
@@ -108,8 +231,11 @@ def import_betsolid(
         if not gamecode:
             continue
 
-        # Hvis hand finnes, hopp
-        if db.query(Hand).filter(Hand.site_hand_id == gamecode).first():
+        # Hvis hand finnes fra før, oppdater likevel kort/board. BetSolid kan
+        # sende hole cards først når hånda er ferdig.
+        existing_hand = db.query(Hand).filter(Hand.site_hand_id == gamecode).first()
+        if existing_hand:
+            import_cards_for_hand(db, existing_hand, game)
             skipped_hands += 1
             continue
 
@@ -239,6 +365,8 @@ def import_betsolid(
                             db.commit()
                         except IntegrityError:
                             db.rollback()
+
+        import_cards_for_hand(db, hand, game)
 
     return {
         "session_id": session.id,
