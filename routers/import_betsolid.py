@@ -3,11 +3,13 @@ from sqlalchemy.orm import Session as DbSession
 from sqlalchemy.exc import IntegrityError
 import xml.etree.ElementTree as ET
 import re
+from pathlib import Path
 
 from database import get_db
 from models import Session as PokerSession, Hand, HandPlayer, Action, Board, HoleCards
 
 router = APIRouter(prefix="/import", tags=["import"])
+HISTORY_DIR = Path(r"C:\Users\denis\AppData\Local\Betsolid Poker\data\angryshark\History\Data")
 
 ACTION_MAP = {
     0: "fold",
@@ -63,12 +65,16 @@ def import_cards_for_hand(db: DbSession, hand: Hand, game: ET.Element) -> None:
         cards_attr = (rnd.attrib.get("cards") or "").strip()
         if cards_attr:
             cards = cards_attr.split()
-            if street == 1 and len(cards) >= 3:
+            if len(cards) >= 3:
                 flop1, flop2, flop3 = cards[0], cards[1], cards[2]
+                if len(cards) >= 4:
+                    turn = cards[3]
+                if len(cards) >= 5:
+                    river = cards[4]
             elif street == 2 and len(cards) >= 1:
-                turn = cards[3] if len(cards) >= 4 else cards[0]
+                turn = cards[0]
             elif street == 3 and len(cards) >= 1:
-                river = cards[4] if len(cards) >= 5 else cards[0]
+                river = cards[0]
 
         for cards_node in rnd.findall("cards"):
             card_type = (cards_node.attrib.get("type") or "").lower()
@@ -376,3 +382,24 @@ def import_betsolid(
         "imported_hand_players": imported_hand_players,
         "imported_actions": imported_actions,
     }
+
+
+@router.post("/betsolid/latest-file", summary="Import latest BetSolid XML file")
+def import_latest_betsolid_file(db: DbSession = Depends(get_db)):
+    if not HISTORY_DIR.exists():
+        raise HTTPException(status_code=404, detail=f"History folder not found: {HISTORY_DIR}")
+
+    files = [p for p in HISTORY_DIR.rglob("*.xml") if p.is_file()]
+    if not files:
+        raise HTTPException(status_code=404, detail="No BetSolid XML files found")
+
+    latest = max(files, key=lambda p: p.stat().st_mtime)
+    try:
+        xml_text = latest.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not read latest BetSolid XML: {e}")
+
+    result = import_betsolid(xml_text=xml_text, db=db)
+    result["file"] = str(latest)
+    result["file_mtime"] = latest.stat().st_mtime
+    return result

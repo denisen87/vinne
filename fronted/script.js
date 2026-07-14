@@ -64,7 +64,7 @@ function wireLiveCaptureButtons() {
 
 function apiBase() {
   // Dashboard input if you have it; else fallback to backend
-  return $("apiBase")?.value?.trim() || "http://127.0.0.1:8010";
+  return $("apiBase")?.value?.trim() || "http://127.0.0.1:8000";
 }
 
 // Global variables for live game polling
@@ -73,6 +73,8 @@ let lastGameState = { hero: "", board: "" };
 let lastAutoFeatureHandId = null;
 let autoEquityRunning = false;
 let pollInProgress = false;
+let adaptiveImportRecoveryInFlight = false;
+let adaptiveImportRecoveryLastAt = 0;
 let manualLiveMode = false;
 let liveScreenActive = false;
 let lastLiveHeroText = "";
@@ -113,14 +115,19 @@ let backendCardHistoryPendingRender = false;
 let backendCardHistoryError = "";
 const BACKEND_CARD_HISTORY_TTL_MS = 3000;
 
-function clearMainHeroForNewLiveHand() {
+function clearMainHeroForNewLiveHand(opts = {}) {
+  if (manualLiveMode && !opts.force) return false;
   const heroEl = $("hero");
   const heroRegisterInput = $("heroRegisterInput");
   if (heroEl) heroEl.value = "";
   if (heroRegisterInput) heroRegisterInput.value = "";
   lastManualHeroText = "";
+  manualPickerHeroCards = [];
+  manualPickerTarget = "hero";
   heroCorrectionCards = [];
+  if (typeof renderManualCardPicker === "function") renderManualCardPicker();
   if (typeof renderHeroCorrection === "function") renderHeroCorrection();
+  return true;
 }
 
 function dashSessionId() {
@@ -910,14 +917,14 @@ function validHistoryIndex(value) {
 
 function sortCardHistoryNewestFirst(list) {
   return [...(list || [])].sort((a, b) => {
+    const atDiff = Number(b.at || 0) - Number(a.at || 0);
+    if (atDiff) return atDiff;
     const ai = validHistoryIndex(a?.overall_index);
     const bi = validHistoryIndex(b?.overall_index);
     if (ai !== null && bi !== null && ai !== bi) return ai - bi;
-    const siteDiff = Number(b.site_hand_id || 0) - Number(a.site_hand_id || 0);
-    if (siteDiff) return siteDiff;
     const handDiff = Number(b.hand_id || 0) - Number(a.hand_id || 0);
     if (handDiff) return handDiff;
-    return Number(b.at || 0) - Number(a.at || 0);
+    return Number(b.site_hand_id || 0) - Number(a.site_hand_id || 0);
   });
 }
 
@@ -942,7 +949,9 @@ function historyEntriesWithBoards(list) {
 
 async function refreshBackendCardHistory(opts = {}) {
   const now = Date.now();
-  const historySessionKey = "file-history-all-db-showdown-made-hand-20260709i";
+  const useSessionFilter = Boolean(opts.sessionScoped);
+  const activeSessionId = useSessionFilter ? (dashSessionId() || $("lhSession")?.value?.trim() || $("ppSession")?.value?.trim() || "") : "";
+  const historySessionKey = `file-history-all-db-showdown-made-hand-20260714i-${activeSessionId || "all"}`;
   if (
     !opts.force &&
     backendCardHistoryLoadedAt &&
@@ -974,6 +983,7 @@ async function refreshBackendCardHistory(opts = {}) {
     const params = new URLSearchParams();
     const heroName = dashHero();
     if (heroName) params.set("player_name", heroName);
+    if (useSessionFilter && activeSessionId) params.set("session_id", activeSessionId);
     params.set("limit", String(opts.limit || 1000));
     params.set("include_showdown", "true");
     const controller = new AbortController();
@@ -1144,9 +1154,10 @@ function buildHeroBoardRankStats(heroCards, historyList) {
     const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
     const board = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
     if (entryHero.length !== 2 || !board.length) return;
+    const entryHeroRanks = new Set(entryHero.map(card => card[0]));
+    if (!heroRanks.some(rank => entryHeroRanks.has(rank))) return;
     boardRows += 1;
 
-    const entryHeroRanks = new Set(entryHero.map(card => card[0]));
     const boardRanks = new Set(board.map(card => card[0]));
     heroRanks.forEach(rank => {
       if (!entryHeroRanks.has(rank)) return;
@@ -1172,6 +1183,7 @@ function buildHeroBoardRankStats(heroCards, historyList) {
     const board = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
     if (entryHero.length !== 2 || !board.length) return;
     const entryHeroRanks = new Set(entryHero.map(card => card[0]));
+    if (!heroRanks.some(rank => entryHeroRanks.has(rank))) return;
     const boardRanks = new Set(board.map(card => card[0]));
     const hits = heroRanks.filter(rank => entryHeroRanks.has(rank) && boardRanks.has(rank));
     if (hits.length === 1) {
@@ -1518,6 +1530,11 @@ function madeHandSignalText(signals) {
 }
 
 function activeManualHeroCardsForHistory() {
+  const liveCards = parseCards(lastLiveHeroText || "").filter(isCard).slice(0, 2);
+  const liveIsFresh = lastLiveCardsSeenAt && (Date.now() - lastLiveCardsSeenAt < 30000);
+  if (liveCards.length === 2 && (liveScreenActive || liveIsFresh)) return liveCards;
+  if (currentGamePoller && !manualLiveMode) return [];
+
   const sources = [
     lastManualHeroText,
     cardsToText(manualPickerHeroCards),
@@ -1529,6 +1546,28 @@ function activeManualHeroCardsForHistory() {
     if (cards.length === 2) return cards;
   }
   return [];
+}
+
+function madeHandSignalMatchesSharedHero(signal, entryHero, board, sharedRanks) {
+  const ranks = new Set(sharedRanks || []);
+  if (!signal || !ranks.size) return false;
+  const name = String(signal.name || "");
+  const sharedHero = (entryHero || []).filter(card => ranks.has(card[0]));
+  if (!sharedHero.length) return false;
+
+  if (name === "High Card") return true;
+
+  if (name === "Flush") {
+    return sharedHero.some(card => card[1] === signal.suit);
+  }
+  if (name === "Straight" || name === "Straight Flush") {
+    return Boolean(straightHighValueWithHero(sharedHero.concat(board || []), sharedHero));
+  }
+
+  const rankText = String(signal.rank || "");
+  if (!rankText) return false;
+  const signalRanks = rankText.match(/[AKQJT2-9]/g) || [];
+  return signalRanks.some(rank => ranks.has(rank));
 }
 
 function renderHeroHistoryMatches(opts = {}) {
@@ -1601,6 +1640,7 @@ function renderHeroHistoryMatches(opts = {}) {
 
     if (matchMode === "exact" && heroExactKey(entryHero) !== heroKey) return;
     if (matchMode === "rank" && heroRankKey(entryHero) !== heroRankKey(heroCards)) return;
+    if (matchMode === "all-boards" && !heroRanks.some(rank => entryHeroRanks.has(rank))) return;
     if (matchMode === "any-rank" && !heroRanks.some(rank => entryHeroRanks.has(rank))) return;
     if (!entryBoard.length) return;
     if (entryBoard.length < minHistoricalBoardCards) return;
@@ -1681,16 +1721,17 @@ function renderHeroHistoryMatches(opts = {}) {
   backendBoardHands.forEach((entry, historyIndex) => {
     const entryHero = (entry.hero || []).map(convertBetSolidCard).filter(isCard).slice(0, 2);
     const board = (entry.board || []).map(convertBetSolidCard).filter(isCard).slice(0, 5);
+    if (entryHero.length !== 2) return;
     const entryHeroRanks = new Set(entryHero.map(card => card[0]));
     const sharedRanks = heroRanks.filter(rank => entryHeroRanks.has(rank));
     if (!sharedRanks.length) return;
     const entryOverallIndex = validHistoryIndex(entry.history_order_index ?? entry.overall_index);
     const historyAgeIndex = entryOverallIndex !== null ? entryOverallIndex : historyIndex;
-    const showdownClass = String(entry.showdown_class || "").trim();
     const localSignals = heroRankMadeHandSignals(entryHero, board);
-    const signalRows = showdownClass
-      ? [{ name: showdownClass, rank: "" }, ...localSignals]
-      : localSignals;
+    const signalRows = localSignals.filter(signal =>
+      madeHandSignalMatchesSharedHero(signal, entryHero, board, sharedRanks)
+    );
+    if (!signalRows.length && localSignals.length) return;
     const madeSignals = signalRows.length
       ? signalRows
       : [{ name: "High Card", rank: "" }];
@@ -1777,7 +1818,7 @@ function renderHeroHistoryMatches(opts = {}) {
 
   const madeHandTable = `
     <div style="margin-top:10px; font-weight:800;">Håndtype i matchende historikk</div>
-    <div style="margin-top:2px; opacity:.6; font-size:11px;">Teller lagret hero + board der lagret hero hadde en av dine nåværende ranker.</div>
+    <div style="margin-top:2px; opacity:.6; font-size:11px;">Teller lagret hero + board der lagret hero delte minst en av dine nåværende ranker.</div>
     <table style="width:100%; border-collapse:collapse; font-size:12px; background:#fff; border:1px solid #e5e7eb; margin-top:5px;">
       <thead>
         <tr style="background:#f3f4f6;">
@@ -1797,8 +1838,8 @@ function renderHeroHistoryMatches(opts = {}) {
         <div>
           <div style="font-weight:800; margin-bottom:2px;">Hero-ranker mot board</div>
           <div style="font-size:10px; opacity:.45; margin-bottom:2px;">visning: file-history-all-db-registered-hero-rank-match-20260708b</div>
-          <div style="font-size:11px; opacity:.65;">${escapeHtml(heroCards.join(" "))} sjekket mot ${sameHeroWithBoardCount} lagrede boards totalt. Radene teller bare lagrede hender der lagret hero hadde ranken og samme rank kom på lagret board.</div>
-          <div style="font-size:11px; opacity:.55; margin-top:2px;">Lagrede boards brukt i match: ${sameHeroWithBoardCount}.</div>
+          <div style="font-size:11px; opacity:.65;">${escapeHtml(heroCards.join(" "))} sjekket mot ${sameHeroWithBoardCount} lagrede boards totalt. Radene teller bare lagrede hender med samme hero-ranker der samme rank kom på lagret board.</div>
+          <div style="font-size:11px; opacity:.55; margin-top:2px;">Lagrede boards brukt i match: ${sameHeroWithBoardCount}. Filter: minst en delt hero-rank.</div>
           ${historyNotice ? `<div style="font-size:12px; color:#b45309; margin-top:6px; font-weight:700;">${escapeHtml(historyNotice)}</div>` : ""}
           ${storedHeroHands && !storedBoardHands ? `<div style="font-size:12px; color:#b45309; margin-top:6px; font-weight:700;">Du har ${storedHeroHands} hero-hender lagret, men ingen boardkort på dem. Registrer board for at match-historikken skal få treff.</div>` : ""}
           <div style="font-size:11px; opacity:.55; margin-top:2px;">Historikkilde: ${escapeHtml(matchSourceLabel)}</div>
@@ -2251,10 +2292,11 @@ function cardsToText(cards) {
   return (cards || []).join(" ");
 }
 
-function setCardInputValue(id, value) {
+function setCardInputValue(id, value, dispatchEvents = true) {
   const el = $(id);
   if (!el) return;
   el.value = value;
+  if (!dispatchEvents) return;
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
 }
@@ -2492,9 +2534,10 @@ function setHeroCorrectionCards(cards) {
   renderHeroCorrection();
 }
 
-function registerHeroCards(heroCards, source = "Hero registrert.") {
+function registerHeroCards(heroCards, source = "Hero registrert.", opts = {}) {
   const normalizedHero = (heroCards || []).map(convertBetSolidCard).filter(Boolean).slice(0, 2);
   const boardCards = [];
+  const deferHeavy = Boolean(opts.deferHeavy);
 
   if (normalizedHero.length !== 2) {
     setHeroRegisterStatus("Hero må ha 2 kort.");
@@ -2516,15 +2559,23 @@ function registerHeroCards(heroCards, source = "Hero registrert.") {
 
   const heroText = cardsToText(normalizedHero);
   lastManualHeroText = heroText;
-  setCardInputValue("hero", heroText);
-  setCardInputValue("heroRegisterInput", heroText);
+  setCardInputValue("hero", heroText, !deferHeavy);
+  setCardInputValue("heroRegisterInput", heroText, !deferHeavy);
   heroCorrectionCards = [];
-  renderHeroCorrection();
-
-  renderManualCardPicker();
-  renderHeroHistoryMatches();
-  scheduleAutoEquity({ manual: true });
   setHeroRegisterStatus(source);
+
+  if (deferHeavy) {
+    window.setTimeout(() => {
+      renderHeroCorrection();
+      renderHeroHistoryMatches();
+      scheduleAutoEquity({ manual: true });
+    }, 20);
+  } else {
+    renderHeroCorrection();
+    renderManualCardPicker();
+    renderHeroHistoryMatches();
+    scheduleAutoEquity({ manual: true });
+  }
   return true;
 }
 
@@ -2697,8 +2748,8 @@ function sendManualPickerToHeroRegister() {
     return false;
   }
 
-  const sent = registerHeroCards(heroCards, "Manuell hero registrert fra kortvelger.");
-  if (sent && status) status.innerText = "Manuell hero sendt til Hero-register.";
+  const sent = registerHeroCards(heroCards, "Manuell hero registrert fra kortvelger.", { deferHeavy: true });
+  if (sent && status) status.innerText = `${cardsToText(heroCards)} sendt til Hero-register.`;
   return sent;
 }
 
@@ -5274,6 +5325,7 @@ async function applyLiveScreenCards() {
       pendingScreenHeroCount = 0;
       liveScreenActive = false;
       clearMainHeroForNewLiveHand();
+      renderHeroHistoryMatches({ skipBackendRefresh: true });
       const autoStatus = $("autoEquityStatus");
       if (autoStatus) autoStatus.innerText = "Live: venter på fersk skjermlesing.";
       return false;
@@ -5305,6 +5357,8 @@ async function applyLiveScreenCards() {
       pendingScreenHeroText = "";
       pendingScreenHeroCount = 0;
       liveScreenActive = false;
+      clearMainHeroForNewLiveHand();
+      renderHeroHistoryMatches({ skipBackendRefresh: true });
       if (autoStatus) autoStatus.innerText = confirmingNewRead ? "Live: bekrefter skjermkort." : "Live: venter på kort.";
       return false;
     }
@@ -5358,6 +5412,33 @@ async function applyLiveScreenCards() {
   }
 }
 
+function triggerLatestBetSolidImport(reason = "refresh") {
+  if (adaptiveImportRecoveryInFlight) return false;
+  if (Date.now() - adaptiveImportRecoveryLastAt < 30000) return false;
+  adaptiveImportRecoveryInFlight = true;
+  adaptiveImportRecoveryLastAt = Date.now();
+
+  const status = $("liveGameStatus");
+  if (status) status.innerText = `Live polling aktiv - importerer nyeste BetSolid-fil (${reason})...`;
+
+  fetch(`${apiBase()}/import/betsolid/latest-file`, { method: "POST" })
+    .then(res => res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`)))
+    .then(info => {
+      console.log("✅ Imported latest BetSolid file:", info);
+      const status = $("liveGameStatus");
+      if (status) status.innerText = "Live polling aktiv - importerte nyeste BetSolid-fil, henter ferske spillere...";
+      window.setTimeout(() => pollCurrentGame().catch(console.warn), 800);
+    })
+    .catch(err => {
+      console.warn("⚠️ latest BetSolid file import failed:", err);
+    })
+    .finally(() => {
+      adaptiveImportRecoveryInFlight = false;
+    });
+
+  return true;
+}
+
 async function pollCurrentGame() {
 
   if (pollInProgress) {
@@ -5400,6 +5481,33 @@ console.timeEnd("latest-with-stats");
       };
       if (data?.session_id) syncActiveSessionFields(data.session_id, "poll");
       await applyLiveScreenCards();
+
+      const adaptiveUpdatedAt = Date.parse(String(data.updated_at || "").replace(" ", "T"));
+      const adaptiveAgeMs = adaptiveUpdatedAt ? Date.now() - adaptiveUpdatedAt : 0;
+      const adaptiveAgeMinutes = adaptiveAgeMs ? Math.max(1, Math.round(adaptiveAgeMs / 60000)) : null;
+      if (adaptiveUpdatedAt && adaptiveAgeMs > 60000) {
+        triggerLatestBetSolidImport("backend-hand eldre enn 60s");
+      }
+      const adaptiveIsStale = adaptiveUpdatedAt && adaptiveAgeMs > 600000;
+      if (adaptiveIsStale) {
+        const playerDetailsEl = $("adaptivePlayerDetails");
+        const liveStatusEl = $("liveGameStatus");
+        const staleHandLabel = data.site_hand_id || data.hand_id || "-";
+        const staleTimeLabel = data.updated_at || "-";
+        if (liveStatusEl) {
+          liveStatusEl.innerText = `Live polling aktiv - venter på fersk watcher-import. Siste backend-hånd: ${staleHandLabel} (${adaptiveAgeMinutes} min gammel).`;
+        }
+        triggerLatestBetSolidImport("stale spillere");
+        if (playerDetailsEl) {
+          playerDetailsEl.innerHTML = `
+            <div style="font-size:11px; opacity:.75; padding:8px; background:#fff7ed; border-left:3px solid #f59e0b;">
+              Motspillere ved bordet er ikke oppdatert. Siste backend-hånd er ${escapeHtml(String(staleHandLabel))}
+              fra ${escapeHtml(String(staleTimeLabel))} (${adaptiveAgeMinutes} min gammel). Restart watcher hvis dette ikke endrer seg.
+            </div>
+          `;
+        }
+        return;
+      }
 
       // Sjekk om board har endra
       if (false && !data.board) {
@@ -5489,6 +5597,11 @@ const previousHandId = lastGameState.hand_id;
 if (data.hand_id && data.hand_id !== previousHandId) {
   lastManualBoardText = "";
   lastLiveBoardText = "";
+  if (currentGamePoller) {
+    lastLiveHeroText = "";
+    lastLiveCardsSeenAt = 0;
+    clearMainHeroForNewLiveHand();
+  }
   await autoLoadCurrentHandFeatures(data);
   if (data.session_id) syncActiveSessionFields(data.session_id, "new-hand");
   scheduleStartingHandsRefresh("new-hand", `hand-${data.hand_id}`);

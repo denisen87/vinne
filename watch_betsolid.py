@@ -1,6 +1,7 @@
 import os
 import time
 import hashlib
+import xml.etree.ElementTree as ET
 from pathlib import Path
 import requests
 
@@ -8,11 +9,14 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 WATCH_DIR = Path(r"C:\Users\denis\AppData\Local\Betsolid Poker\data\angryshark\History\Data")
-API_URL = os.getenv("BETSOLID_IMPORT_URL", "http://127.0.0.1:8010/import/betsolid")
+API_URL = os.getenv("BETSOLID_IMPORT_URL", "http://127.0.0.1:8000/import/betsolid")
 
 # Enkel debounce: ikke importer samme uendrede fil for ofte
-LAST_SENT: dict[str, tuple[float, str]] = {}
+LAST_SENT: dict[str, tuple[float, str, bool]] = {}
 MIN_SECONDS_BETWEEN = 2.0
+IMPORT_TIMEOUT_SECONDS = 60
+POLL_SECONDS = 5.0
+RECENT_SCAN_LIMIT = 12
 
 HERO_NAME = "angryshark"
 
@@ -108,24 +112,29 @@ class Handler(FileSystemEventHandler):
         now = time.time()
         content_hash = hashlib.sha1(xml_text.encode("utf-8", errors="ignore")).hexdigest()
         last = LAST_SENT.get(key)
-        if last and last[1] == content_hash and (now - last[0]) < MIN_SECONDS_BETWEEN:
-            return
+        if last and last[1] == content_hash:
+            if last[2]:
+                return
+            if (now - last[0]) < MIN_SECONDS_BETWEEN:
+                return
 
         # Tillat at filer starter med f.eks. BOM eller <?xml ...?>
         if "<session" not in xml_text[:500]:
             return
 
         # Send kun ferdig filhistorikk til API for full import.
+        ok = False
         try:
-            r = requests.post(API_URL, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/plain"}, timeout=10)
+            r = requests.post(API_URL, data=xml_text.encode("utf-8"), headers={"Content-Type": "text/plain"}, timeout=IMPORT_TIMEOUT_SECONDS)
             if r.status_code == 200:
+                ok = True
                 print(f"[OK] Imported {p.name}: {r.json()}")
             else:
                 print(f"[FAIL] {p.name} -> {r.status_code}: {r.text[:200]}")
         except Exception as e:
             print(f"[ERROR] {p.name}: {e}")
 
-        LAST_SENT[key] = (now, content_hash)
+        LAST_SENT[key] = (now, content_hash, ok)
 
 
 def import_recent_existing_files(handler: Handler, limit: int = 80) -> None:
@@ -150,9 +159,14 @@ def main():
     print("Mode: file history only")
     print("Press Ctrl+C to stop.")
 
+    last_poll = 0.0
     try:
         while True:
             time.sleep(0.5)
+            now = time.time()
+            if now - last_poll >= POLL_SECONDS:
+                last_poll = now
+                import_recent_existing_files(event_handler, limit=RECENT_SCAN_LIMIT)
     except KeyboardInterrupt:
         observer.stop()
     observer.join()
